@@ -1,0 +1,1167 @@
+// ==UserScript==
+// @name         Die Stämme Forum Crawler – AI Dashboard (OpenRouter, Laienfreundlich)
+// @namespace    http://tampermonkey.net/
+// @version      6.1.0
+// @description  Crawlt Forenbeiträge, analysiert sie lokal & via OpenRouter-KI, zeigt laienfreundliche Kurzfassung + detailierten Deep-Dive im Dashboard. Auto-KI hält dich auf dem Laufenden. (Kein Download nötig.)
+// @author       AI-Enhanced
+// @match        https://*.die-staemme.de/game.php?*screen=forum*
+// @run-at       document-idle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_addStyle
+// @grant        GM_notification
+// @grant        GM_xmlhttpRequest
+// @connect      openrouter.ai
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /*****************************************************************
+   * Konstanten, Storage-Keys, Defaults
+   *****************************************************************/
+  const LS_PREFIX = 'DS_AI_DASH_V6';
+  const LS = {
+    settings: `${LS_PREFIX}_settings`,
+    knownPosts: `${LS_PREFIX}_knownPosts`,
+    threadCache: `${LS_PREFIX}_threadCache`,
+    lastAi: `${LS_PREFIX}_lastAi`,
+    lastHash: `${LS_PREFIX}_lastHash`,
+    auto: `${LS_PREFIX}_autoEnabled`,
+  };
+
+  const DEFAULTS = {
+    theme: 'auto',                 // auto | light | dark
+    batchSize: 3,                  // parallele Threads
+    delayMinMs: 700,
+    delayMaxMs: 1400,
+    requestTimeoutMs: 15000,
+    maxPagesPerThread: 5,
+    onlyNewSinceHours: 0,          // 0 = alles
+    persistAuto: true,
+
+    // AI
+    aiEnabled: true,
+    aiAutoMinutes: 5,
+    aiModel: 'x-ai/grok-4-mini:free',    // z.B. 'x-ai/grok-4-mini:free'
+    aiKey: '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',
+    aiLang: 'de-DE',
+    aiMaxChars: 24000,             // Sicherheitslimit für Payload
+    aiAnonymize: false,            // Spielernamen & Koords ersetzen
+    aiNotify: true,                // GM_notification bei High-Severity
+  };
+
+  // Utils
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
+  const nowIso = () => new Date().toISOString();
+  const html = String.raw;
+  const toArray = (x) => Array.isArray(x) ? x : Array.from(x || []);
+  const sha1 = async (text) => {
+    const enc = new TextEncoder().encode(text);
+    const buf = await crypto.subtle.digest('SHA-1', enc);
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  };
+  const tryJSON = (s) => {
+    if (!s) return null;
+    const clean = s.replace(/```json|```/gi, '').trim();
+    try { return JSON.parse(clean); } catch { return null; }
+  };
+
+  /*****************************************************************
+   * Storage Helper
+   *****************************************************************/
+  function lsGet(key, fallback) {
+    try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; } catch { return fallback; }
+  }
+  function lsSet(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+  }
+
+  /*****************************************************************
+   * AI Client (OpenRouter)
+   *****************************************************************/
+  const AiClient = {
+    async chat({ apiKey, model, system, user, max_tokens = 900, temperature = 0.4, top_p = 0.9 }) {
+      if (!apiKey) throw new Error('Kein OpenRouter API-Key gesetzt.');
+      const url = 'https://openrouter.ai/api/v1/chat/completions';
+      const body = {
+        model,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user }
+        ],
+        temperature, top_p, max_tokens,
+        frequency_penalty: 0.3,
+        presence_penalty: 0.1
+      };
+
+      // Primär: GM_xmlhttpRequest (CORS-sicher)
+      try {
+        const res = await new Promise((resolve, reject) => {
+          GM_xmlhttpRequest({
+            method: 'POST',
+            url,
+            headers: {
+              'Authorization': `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+              'HTTP-Referer': location.href,
+              'X-Title': 'Die Stämme AI Dashboard'
+            },
+            data: JSON.stringify(body),
+            onload: (r) => {
+              if (r.status >= 200 && r.status < 300) resolve({ ok: true, json: () => JSON.parse(r.responseText) });
+              else reject(new Error(`OpenRouter HTTP ${r.status}: ${r.responseText.slice(0, 240)}`));
+            },
+            onerror: () => reject(new Error('OpenRouter Request-Error')),
+            timeout: 30000,
+            ontimeout: () => reject(new Error('OpenRouter Timeout'))
+          });
+        });
+        const data = await res.json();
+        const text = data?.choices?.[0]?.message?.content || '';
+        return text;
+      } catch (e) {
+        // Fallback: fetch (falls GM_ blockiert)
+        try {
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+              'HTTP-Referer': location.href,
+              'X-Title': 'Die Stämme AI Dashboard'
+            },
+            body: JSON.stringify(body)
+          });
+          if (!res.ok) throw new Error(`OpenRouter HTTP ${res.status}`);
+          const data = await res.json();
+          const text = data?.choices?.[0]?.message?.content || '';
+          return text;
+        } catch (e2) {
+          throw e; // gib den GM_ Fehler zurück (klarer)
+        }
+      }
+    }
+  };
+
+  /*****************************************************************
+   * ForumCrawler (Refactor)
+   *****************************************************************/
+  class ForumCrawler {
+    constructor(settings) {
+      this.settings = settings;
+      this.posts = [];
+      this.dashboardData = this._emptyDashboard();
+      this.knownPosts = new Set(lsGet(LS.knownPosts, []));
+      this.threadCache = lsGet(LS.threadCache, {});
+      this.abortController = null;
+    }
+    _emptyDashboard() {
+      return {
+        overview: {
+          stats: { activePlayers: new Set(), totalBattles: 0, totalMessages: 0, lastUpdate: nowIso() },
+          alerts: [],
+          recentActivities: []
+        },
+        reports: { battles: [], spy: [], movements: [], buildingChanges: [], trades: [] },
+        messages: [],
+        intel: { playerStrength: {}, villageInfo: {}, coordsData: {} },
+      };
+    }
+    _saveKnown() { lsSet(LS.knownPosts, [...this.knownPosts]); }
+    _saveCache() { lsSet(LS.threadCache, this.threadCache); }
+
+    async crawlAll({ onProgress, autoMode = false } = {}) {
+      this.posts = [];
+      this.dashboardData = this._emptyDashboard();
+      this.abortController = new AbortController();
+      const signal = this.abortController.signal;
+
+      const { threads, found } = this.collectRecentThreads();
+      if (!found) throw new Error('Keine Forenbeiträge gefunden.');
+
+      const total = threads.length;
+      let done = 0;
+      const q = threads.slice();
+      const workers = Array.from({ length: this.settings.batchSize }).map(async () => {
+        while (q.length && !signal.aborted) {
+          const t = q.shift();
+          const batch = await this._crawlThread(t, autoMode, signal);
+          this.posts.push(...batch);
+          done++;
+          onProgress && onProgress(done, total);
+          await sleep(this._rand(this.settings.delayMinMs, this.settings.delayMaxMs));
+        }
+      });
+
+      await Promise.race([
+        Promise.all(workers),
+        new Promise((_, rej) => signal.addEventListener('abort', () => rej(new Error('Abgebrochen'))))
+      ]);
+
+      await this._aggregate();
+      return this.dashboardData;
+    }
+
+    stop() { if (this.abortController) this.abortController.abort(); }
+
+    collectRecentThreads() {
+      const recent = document.querySelector('#forum-recent-posts .widget-content table.vis.nowrap tbody');
+      if (!recent) return { threads: [], found: false };
+      const out = [];
+      recent.querySelectorAll('tr').forEach((row) => {
+        if (row.querySelector('th')) return;
+        const link = row.querySelector('td:first-child a');
+        const forumCell = row.querySelector('td.center');
+        const authorCell = row.querySelector('td:last-child');
+        if (!link || !forumCell || !authorCell) return;
+        const author = authorCell.querySelector('a')?.textContent.trim() || 'Unbekannt';
+        const dateText = (authorCell.textContent || '').split('\n').pop().trim();
+        out.push({ title: link.textContent.trim(), url: link.href, forum: forumCell.textContent.trim(), author, date: dateText });
+      });
+      return { threads: out, found: true };
+    }
+
+    async _crawlThread(thread, autoMode, signal) {
+      const cacheKey = `threadCache_${thread.url}`;
+      const cached = this.threadCache[cacheKey];
+      if (cached && autoMode && (Date.now() - cached.timestamp < 3600000)) return cached.posts || [];
+
+      const posts = [];
+      try {
+        const doc = await this._fetchDom(thread.url, signal);
+        if (!doc) return posts;
+        posts.push(...this._extractPosts(doc, thread));
+
+        const lastPage = this._detectLastPage(doc);
+        const maxPages = clamp(this.settings.maxPagesPerThread, 1, 50);
+        const targetLast = Math.min(lastPage, maxPages);
+
+        const urls = [];
+        for (let p = 2; p <= targetLast; p++) {
+          urls.push(`${thread.url}${thread.url.includes('&page=') ? '' : '&page='}${p}`);
+        }
+        // Seiten parallel (klein)
+        const LIM = 3;
+        const q = urls.slice();
+        const worker = async () => {
+          while (q.length && !signal.aborted) {
+            const u = q.shift();
+            const d = await this._fetchDom(u, signal);
+            if (d) posts.push(...this._extractPosts(d, thread));
+            await sleep(this._rand(250, 600));
+          }
+        };
+        await Promise.all(Array.from({ length: LIM }, worker));
+      } catch (e) {
+        console.error('Thread-Crawl Fehler', thread, e);
+      }
+      this.threadCache[cacheKey] = { timestamp: Date.now(), posts };
+      this._saveCache();
+      return posts;
+    }
+
+    _detectLastPage(doc) {
+      const nums = toArray(doc.querySelectorAll('.paged-nav-item'))
+        .map((el) => parseInt(el.textContent, 10)).filter((n) => !isNaN(n));
+      if (nums.length) return Math.max(...nums);
+      const anchors = toArray(doc.querySelectorAll('a[href*="&page="]'));
+      const fromHref = anchors.map(a => (a.href.match(/[?&]page=(\d+)/)?.[1])).map(x => parseInt(x || '1', 10)).filter(n => !isNaN(n));
+      return fromHref.length ? Math.max(...fromHref) : 1;
+    }
+
+    async _fetchDom(url, outerSignal) {
+      const inner = new AbortController();
+      const timer = setTimeout(() => inner.abort(), this.settings.requestTimeoutMs);
+      const combo = new AbortController();
+      const onAbort = () => combo.abort();
+      inner.signal.addEventListener('abort', onAbort, { once: true });
+      outerSignal?.addEventListener('abort', onAbort, { once: true });
+      try {
+        const res = await fetch(url, { credentials: 'include', signal: combo.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const txt = await res.text();
+        return new DOMParser().parseFromString(txt, 'text/html');
+      } catch (e) {
+        if (String(e).includes('AbortError')) return null;
+        console.error('fetchDom', url, e);
+        return null;
+      } finally { clearTimeout(timer); }
+    }
+
+    _extractPosts(doc, thread) {
+      const arr = [];
+      const container = doc.querySelector('#forum_box') || doc;
+      const nodes = toArray(container.querySelectorAll('.post'));
+
+      const minDate = this.settings.onlyNewSinceHours > 0
+        ? new Date(Date.now() - this.settings.onlyNewSinceHours * 3600_000)
+        : null;
+
+      for (const post of nodes) {
+        const authorLink = post.querySelector('.postheader_left a[href*="screen=info_player"]');
+        const author = authorLink ? authorLink.textContent.trim() : 'Unbekannt';
+        const postId = post.querySelector('a[name]')?.getAttribute('name') || '';
+        const date = post.querySelector('.igmline-date')?.textContent.trim() || 'Kein Datum';
+        const contentHtml = post.querySelector('.text')?.innerHTML || '';
+        const content = this._stripRich(contentHtml);
+
+        if (minDate) {
+          const d = this._tryParseGermanDate(date);
+          if (d && d < minDate) continue;
+        }
+
+        const key = `${thread.title}__${author}__${date}__${postId}`;
+        if (this.knownPosts.has(key)) continue;
+
+        arr.push({
+          id: postId || this._rid(),
+          thread: thread.title,
+          forum: thread.forum,
+          author, date, content, isNew: true,
+          threadContext: { title: thread.title, forum: thread.forum, category: thread.category || 'Allgemein' },
+        });
+
+        this.knownPosts.add(key);
+      }
+      this._shrinkKnown();
+      this._saveKnown();
+      return arr;
+    }
+
+    _stripRich(htmlStr) {
+      const div = document.createElement('div');
+      const norm = (htmlStr || '').replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n</p>');
+      div.innerHTML = norm;
+      const text = div.textContent || div.innerText || '';
+      return text.replace(/\u00A0/g, ' ').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    }
+
+    _shrinkKnown() {
+      const MAX = 3000;
+      if (this.knownPosts.size <= MAX) return;
+      const toRemove = this.knownPosts.size - MAX;
+      const it = this.knownPosts.values();
+      for (let i = 0; i < toRemove; i++) this.knownPosts.delete(it.next().value);
+    }
+
+    _tryParseGermanDate(text) {
+      const m = (text || '').match(/(\d{1,2})\.(\d{1,2})\.(\d{4}).*?(\d{1,2}):(\d{2})/);
+      if (!m) return null;
+      const [_, dd, MM, yyyy, hh, mm] = m.map((s) => parseInt(s, 10));
+      const d = new Date(yyyy, MM - 1, dd, hh, mm);
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    _rid() { return Math.random().toString(36).slice(2, 10); }
+    _rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+    // --- Aggregation (leicht gestrafft, Fokus: AI-Payload) ---
+    async _aggregate() {
+      const d = this.dashboardData;
+      for (const p of this.posts) {
+        const type = this._detectType(p.content);
+        d.messages.push({ id: p.id, author: p.author, date: p.date, content: p.content, type, thread: p.thread, forum: p.forum });
+        d.overview.stats.totalMessages++;
+        d.overview.stats.activePlayers.add(p.author);
+        if (type === 'attack') d.overview.stats.totalBattles++;
+        if (type === 'support') {
+          const coords = this._extractCoords(p.content);
+          if (coords) d.overview.alerts.push({ type: 'support_needed', date: p.date, author: p.author, coords, content: p.content });
+        }
+      }
+      d.overview.stats.activePlayers = Array.from(d.overview.stats.activePlayers);
+      d.overview.stats.lastUpdate = nowIso();
+    }
+
+    _detectType(content) {
+      const c = (content || '').toLowerCase();
+      if (/hat gewonnen|angriff|deffbruch|rammen|kata/.test(c)) return 'attack';
+      if (/späher|ausgekundschaftet|spionage/.test(c)) return 'spy';
+      if (/bewegung|unterwegs|ankunft/.test(c)) return 'movement';
+      if (/handel|marktplatz|ressourcen/.test(c)) return 'trade';
+      if (/gebäude.*(hochgestuft|abgerissen)/.test(c)) return 'building';
+      if (/unterstützung|deff\b/.test(c)) return 'support';
+      return 'other';
+    }
+    _extractCoords(content) {
+      const m = (content || '').match(/\b(\d{3})\|(\d{3})\b/);
+      return m ? `${m[1]}|${m[2]}` : null;
+    }
+
+    // Export für AI (ohne Downloads)
+    async buildPayload() {
+      const tribe = (document.querySelector('h2')?.textContent || '').trim();
+      return {
+        meta: {
+          timestamp: nowIso(),
+          server: window.location.hostname.split('.')[0],
+          tribe,
+          version: '6.1.0'
+        },
+        data: this.dashboardData,
+      };
+    }
+  }
+
+  /*****************************************************************
+   * AI Orchestrator – Laienfreundlich + Deep-Details
+   *****************************************************************/
+  class AiOrchestrator {
+    constructor(settings) {
+      this.settings = settings;
+      this.lastAi = lsGet(LS.lastAi, null);
+    }
+
+    _anonymize(payload) {
+      if (!this.settings.aiAnonymize) return payload;
+      const nameMap = new Map();
+      let idx = 1;
+      const mapName = (n) => {
+        if (!n) return n;
+        if (!nameMap.has(n)) nameMap.set(n, `[P${idx++}]`);
+        return nameMap.get(n);
+      };
+      const replCoords = (s) => (s || '').replace(/\b(\d{3})\|(\d{3})\b/g, '[K$1|$2]');
+      const clone = JSON.parse(JSON.stringify(payload));
+      for (const m of clone.data.messages) {
+        m.author = mapName(m.author);
+        m.content = replCoords(m.content);
+      }
+      for (const a of (clone.data.overview.alerts || [])) {
+        if (a.author) a.author = mapName(a.author);
+        if (a.coords) a.coords = replCoords(a.coords);
+        if (a.content) a.content = replCoords(a.content);
+      }
+      return clone;
+    }
+
+    _compact(payload) {
+      // Beschneide auf die letzten X Nachrichten & Kernsummen, plus Alerts/Movements
+      const MAX_MSG = 220; // letzte 220 Nachrichten
+      const data = payload.data;
+      const compacted = {
+        meta: payload.meta,
+        stats: {
+          totalMessages: data.overview.stats.totalMessages,
+          totalBattles: data.overview.stats.totalBattles,
+          activePlayers: (data.overview.stats.activePlayers || []).length,
+          lastUpdate: data.overview.stats.lastUpdate
+        },
+        alerts: (data.overview.alerts || []).slice(-50),
+        messages: (data.messages || []).slice(-MAX_MSG).map(m => ({
+          date: m.date, type: m.type, author: m.author, thread: m.thread,
+          content: (m.content || '').length > 800 ? (m.content.slice(0, 800) + ' …') : m.content
+        })),
+        reports: {
+          counts: {
+            battles: data.reports?.battles?.length || 0,
+            spy: data.reports?.spy?.length || 0,
+            movements: data.reports?.movements?.length || 0,
+            buildingChanges: data.reports?.buildingChanges?.length || 0,
+            trades: data.reports?.trades?.length || 0
+          }
+        }
+      };
+
+      let jsonText = JSON.stringify(compacted);
+      if (jsonText.length > this.settings.aiMaxChars) {
+        const ratio = this.settings.aiMaxChars / jsonText.length;
+        const keep = Math.max(50, Math.floor((compacted.messages.length) * ratio * 0.9));
+        compacted.messages = compacted.messages.slice(-keep);
+        jsonText = JSON.stringify(compacted);
+      }
+      return compacted;
+    }
+
+    _systemPrompt(lang) {
+      return (
+        "Du bist ein erfahrener Analyst für 'Die Stämme' (Tribal Wars). " +
+        "Deine Aufgabe: Erkläre die Lage so, dass auch Außenstehende sie verstehen (ohne Vorwissen). " +
+        "Vermeide Jargon oder erkläre ihn im Glossar. Gib klare, umsetzbare To‑dos mit Priorität. " +
+        "Schreibe in " + (this.settings.aiLang || lang || "de-DE") + ". " +
+        "WICHTIG: Antworte AUSSCHLIESSLICH als gültiges JSON nach Schema; KEIN Fließtext außerhalb von JSON."
+      );
+    }
+
+    _userPrompt(compacted) {
+      return (
+        "INPUT (kompakt, aus dem Forum):\n" +
+        JSON.stringify(compacted) + "\n\n" +
+        "AUSGABESCHEMA (JSON, streng einhalten):\n" +
+`{
+  "summary_plain": "Ein Absatz (<= 500 Wörter) in einfacher Sprache: Was ist los?",
+  "highlights": ["5-10 kurze Stichpunkte, sehr klar formuliert"],
+  "why_it_matters": ["2-5 Sätze, warum das wichtig ist"],
+  "actions": [
+    {"title": "konkreter nächster Schritt", "priority": "high|med|low", "coords": ["optional 500|500"], "deadline": "optional ISO oder leer"}
+  ],
+  "threats": [
+    {"type": "attack|spy|unknown", "severity": "high|med|low", "where": "Koord/Thread/Spieler", "evidence": "kurzer Beleg"}
+  ],
+  "intel_changes": [
+    {"coord": "500|500", "change": "z.B. 'Mauer -2', 'neue Truppenstärke gesichtet'"}
+  ],
+  "glossary": [
+    {"term": "Begriff", "meaning": "leicht verständliche Erklärung, 1-2 Sätze"}
+  ],
+  "confidence": 0.0
+}
+REGELN:
+- Schreibe IMMER laienfreundlich (keine Abkürzungen ohne Erklärung).
+- "summary_plain" muss ohne Vorwissen verständlich sein.
+- Keine BB-Codes im Output.
+- Keine zusätzlichen Felder, keine Kommentare.
+- Maximal 500 Wörter in "summary_plain".`
+      );
+    }
+
+    async analyze(payloadFull) {
+      // 1) anonymize/compact
+      const sanitized = this._anonymize(payloadFull);
+      const compacted = this._compact(sanitized);
+
+      // 2) Hash (um unnötige Calls zu vermeiden)
+      const hash = await sha1(JSON.stringify(compacted));
+      const lastHash = lsGet(LS.lastHash, '');
+      const shouldSkip = this.settings.aiEnabled && lastHash && lastHash === hash && this.lastAi;
+      if (shouldSkip) return { reused: true, result: this.lastAi };
+
+      // 3) Call AI
+      const system = this._systemPrompt(this.settings.aiLang || 'de-DE');
+      const user = this._userPrompt(compacted);
+
+      let raw = '';
+      try {
+        raw = await AiClient.chat({
+          apiKey: this.settings.aiKey,
+          model: this.settings.aiModel,
+          system, user,
+          max_tokens: 900,
+          temperature: 0.4
+        });
+      } catch (e) {
+        throw new Error(e.message || 'OpenRouter Fehler');
+      }
+
+      // 4) Parse
+      const parsed = tryJSON(raw) || tryJSON(this._jsonRepair(raw)) || null;
+      if (!parsed || typeof parsed !== 'object') {
+        const fallback = {
+          summary_plain: 'Konnte keine strukturierte Antwort parsen. Prüfe API-Key/Modell oder versuche es erneut.',
+          highlights: [],
+          why_it_matters: [],
+          actions: [],
+          threats: [],
+          intel_changes: [],
+          glossary: [],
+          confidence: 0.0
+        };
+        this.lastAi = { raw, parsed: fallback, at: nowIso() };
+      } else {
+        this.lastAi = { raw, parsed, at: nowIso() };
+      }
+
+      lsSet(LS.lastAi, this.lastAi);
+      lsSet(LS.lastHash, hash);
+      return { reused: false, result: this.lastAi };
+    }
+
+    _jsonRepair(s) {
+      let t = (s || '').replace(/```json|```/g, '').trim().replace(/^\uFEFF/, '');
+      t = t.replace(/,\s*([}\]])/g, '$1'); // trailing commas
+      return t;
+    }
+  }
+
+  /*****************************************************************
+   * UI & Controller
+   *****************************************************************/
+  class App {
+    constructor() {
+      // Load settings
+      this.settings = { ...DEFAULTS, ...lsGet(LS.settings, {}) };
+      this.crawler = new ForumCrawler(this.settings);
+      this.ai = new AiOrchestrator(this.settings);
+
+      // UI refs
+      this.root = null; this.$ = null;
+      this.statusEl = null;
+      this.progressWrap = null; this.progressBar = null; this.progressText = null;
+
+      this.btnCrawl = null; this.btnStop = null; this.btnPreview = null;
+      this.chkAuto = null;
+      this.selTheme = null; this.selHours = null;
+      this.sliderPages = null; this.sliderParallel = null;
+
+      this.btnAnalyze = null; this.btnAiSettings = null;
+
+      this.autoInterval = null;
+
+      window.addEventListener('load', () => this.setupUI());
+      this._setupMenus();
+    }
+
+    _setupMenus() {
+      try {
+        GM_registerMenuCommand('AI: API-Key setzen/ändern', () => {
+          const prev = this.settings.aiKey || '';
+          const val = prompt('OpenRouter API-Key (openrouter.ai):', prev);
+          if (val != null) { this.settings.aiKey = val.trim(); this._saveSettings(); alert('Gespeichert.'); }
+        });
+        GM_registerMenuCommand('AI: Modell setzen', () => {
+          const prev = this.settings.aiModel || 'openrouter/auto';
+          const val = prompt('OpenRouter Modell (z. B. "openrouter/auto", "x-ai/grok-4-mini:free"):', prev);
+          if (val != null) { this.settings.aiModel = val.trim(); this._saveSettings(); alert('Gespeichert.'); }
+        });
+        GM_registerMenuCommand('AI: Anonymisierung umschalten', () => {
+          this.settings.aiAnonymize = !this.settings.aiAnonymize; this._saveSettings();
+          alert('Anonymisierung: ' + (this.settings.aiAnonymize ? 'AN' : 'AUS'));
+        });
+      } catch {}
+    }
+
+    _saveSettings() { lsSet(LS.settings, this.settings); }
+
+    setupUI() {
+      const anchor = document.querySelector('#forum-recent-posts');
+      if (!anchor) return;
+
+      // Host+Shadow
+      const host = document.createElement('div');
+      host.id = 'ds-ai-dashboard-root';
+      const header = anchor.querySelector('.head') || anchor;
+      header.parentNode.insertBefore(host, header.nextSibling);
+      const shadow = host.attachShadow({ mode: 'open' });
+      this.root = shadow;
+      this.$ = (sel) => shadow.querySelector(sel);
+
+      shadow.innerHTML = html`
+        <style>
+          :host, * { box-sizing: border-box; }
+          .ui[data-theme="light"]{
+            --bg: #faf6ef; --panel: #ffffff; --text: #2e261d; --muted:#7b5b3c;
+            --accent: #8a5a2f; --accent-2:#c28a57; --accent-3:#52351d;
+            --ok: #2e7d32; --warn:#b26a00; --err:#b00020; --line:#e8dccb;
+          }
+          .ui[data-theme="dark"]{
+            --bg: #1a1410; --panel: #231a14; --text:#f6eee5; --muted:#cdb399;
+            --accent: #cf9e6d; --accent-2:#a87b53; --accent-3:#e8caa6;
+            --ok:#8bd08f; --warn:#ffb74d; --err:#ff6b81; --line:#34271e;
+          }
+          .ui[data-theme="auto"]{ color-scheme: light dark; }
+          @media (prefers-color-scheme: dark) {
+            .ui[data-theme="auto"]{
+              --bg: #1a1410; --panel: #231a14; --text:#f6eee5; --muted:#cdb399;
+              --accent: #cf9e6d; --accent-2:#a87b53; --accent-3:#e8caa6;
+              --ok:#8bd08f; --warn:#ffb74d; --err:#ff6b81; --line:#34271e;
+            }
+          }
+          .wrap{ margin: 10px 0 14px 0; border:1px solid var(--line); border-radius: 10px;
+                 background: var(--panel); color: var(--text); box-shadow: 0 6px 18px rgba(0,0,0,.12); }
+          .bar{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:10px;
+                background: linear-gradient(180deg, var(--bg), var(--panel)); border-bottom:1px solid var(--line); }
+          .title{ font-weight:700; display:flex; gap:8px; margin-right:auto; color: var(--accent-3); }
+          .dot{ width:10px; height:10px; border-radius:50%; background: var(--accent); }
+          .btn{ appearance:none; border:1px solid var(--line); background:var(--panel); color:var(--text);
+                padding:7px 12px; border-radius:8px; cursor:pointer; font-weight:600; }
+          .btn:hover{ transform: translateY(-1px); box-shadow: 0 3px 10px rgba(0,0,0,.12); }
+          .btn.primary{ background: var(--accent); color:#fff; border-color:transparent; }
+          .btn.stop{ background: var(--err); color:#fff; border-color: transparent; }
+          .btn.ok{ background: var(--ok); color:#fff; border-color: transparent; }
+          .btn.ghost{ background: transparent; }
+          .btn[disabled]{ opacity:.6; pointer-events:none; }
+          .sep{ width:1px; align-self:stretch; background: var(--line); margin: 0 2px; }
+          .field{ display:flex; align-items:center; gap:6px; padding:0 4px; }
+          .field label{ color: var(--muted); font-weight:600; }
+          .field input[type="range"]{ width: 140px; }
+          .progress{ position:relative; height:26px; border-radius:8px; overflow:hidden;
+                     background: var(--bg); border:1px solid var(--line); flex:1 1 220px; min-width:220px; }
+          .progress > .bar{ position:absolute; inset:0; width:0%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition:width .25s ease; }
+          .progress > .txt{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:800; text-shadow:0 1px 2px rgba(0,0,0,.35); }
+          .status{ padding:10px; background: var(--bg); color: var(--muted); border-top:1px solid var(--line); }
+          .panel{ padding:10px; }
+          .actions{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+          .small{ font-size:12px; }
+
+          /* Modal */
+          .modal{ position: fixed; inset: 0; background: rgba(0,0,0,.5); display:none; align-items:center; justify-content:center; z-index: 999999; }
+          .modal[open]{ display:flex; }
+          .dialog{ width:min(1100px,95vw); max-height:85vh; overflow:hidden; border-radius:12px; background:var(--panel);
+                   border:1px solid var(--line); color:var(--text); box-shadow:0 30px 60px rgba(0,0,0,.35); display:flex; flex-direction:column; }
+          .dialog .hd{ display:flex; align-items:center; gap:8px; padding:12px; border-bottom:1px solid var(--line); }
+          .tabs{ display:flex; gap:6px; margin-left:auto; }
+          .tab{ padding:6px 10px; border-radius:7px; cursor:pointer; font-weight:700; color: var(--muted); }
+          .tab[active]{ background: var(--bg); color: var(--text); border:1px solid var(--line); }
+          .dialog .bd{ padding:12px; overflow:auto; background: var(--bg); color: var(--text); }
+          .card{ background: var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:10px; }
+          .card h4{ margin:0 0 8px 0; }
+          table{ width:100%; border-collapse:collapse; }
+          th, td{ text-align:left; border-bottom:1px solid var(--line); padding:6px 4px; vertical-align:top; }
+          .muted{ color: var(--muted); }
+          .kpi{ font-weight:800; font-size:20px; }
+          .pill{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; }
+          .pill.ok{ background: rgba(46,125,50,.2); color: var(--ok); }
+          .pill.warn{ background: rgba(255,183,77,.2); color: var(--warn); }
+          .pill.err{ background: rgba(255,107,129,.2); color: var(--err); }
+
+          .hint{ font-size:12px; color: var(--muted); }
+          .subgrid{ display:grid; grid-template-columns: repeat(auto-fit,minmax(240px,1fr)); gap:10px; }
+          .kv{ display:flex; justify-content:space-between; gap:8px; }
+          .kv code{ opacity:.8; }
+        </style>
+
+        <div class="ui" data-theme="${this.settings.theme}">
+          <div class="wrap">
+            <div class="bar">
+              <div class="title"><span class="dot"></span> <span>Forum Crawler · AI Dashboard</span></div>
+
+              <button class="btn primary" id="btnCrawl">📥 Crawlen</button>
+              <button class="btn stop" id="btnStop" disabled>⏹️ Stop</button>
+
+              <div class="field">
+                <label>Auto‑KI</label>
+                <input type="checkbox" id="chkAuto">
+                <span class="small muted">alle</span>
+                <input type="number" id="aiEvery" min="1" max="60" value="${this.settings.aiAutoMinutes}" style="width:54px;">
+                <span class="small muted">Min</span>
+              </div>
+
+              <div class="sep"></div>
+
+              <div class="field">
+                <label>Seitentiefe</label>
+                <input type="range" id="rngPages" min="1" max="20" step="1" value="${this.settings.maxPagesPerThread}">
+                <span id="rngPagesVal" class="small muted">${this.settings.maxPagesPerThread}</span>
+              </div>
+
+              <div class="field">
+                <label>Parallel</label>
+                <input type="range" id="rngParallel" min="1" max="8" step="1" value="${this.settings.batchSize}">
+                <span id="rngParallelVal" class="small muted">${this.settings.batchSize}</span>
+              </div>
+
+              <div class="field">
+                <label>Neu seit</label>
+                <select id="selHours">
+                  <option value="0">Alles</option>
+                  <option value="6">6h</option>
+                  <option value="12">12h</option>
+                  <option value="24">24h</option>
+                  <option value="72">3 Tage</option>
+                  <option value="168">7 Tage</option>
+                  <option value="720">30 Tage</option>
+                </select>
+              </div>
+
+              <div class="field">
+                <label>Theme</label>
+                <select id="selTheme">
+                  <option value="auto">Auto</option>
+                  <option value="light">Hell</option>
+                  <option value="dark">Dunkel</option>
+                </select>
+              </div>
+
+              <div class="sep"></div>
+
+              <button class="btn" id="btnAnalyze">🤖 KI analysieren</button>
+              <button class="btn ghost" id="btnAiSettings">⚙️ AI</button>
+              <button class="btn ghost" id="btnPreview">🖥️ Vorschau</button>
+
+              <div class="progress" id="progressWrap" style="display:none;">
+                <div class="bar" id="progressBar"></div>
+                <div class="txt" id="progressText">0%</div>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="hint">
+                Hinweis: Bei aktiver KI werden kompakte Foren-Daten an openrouter.ai gesendet.
+                <strong>Anonymisierung</strong> kann in den AI‑Einstellungen aktiviert werden.
+              </div>
+            </div>
+
+            <div class="status" id="status">Bereit</div>
+          </div>
+
+          <div class="modal" id="modal">
+            <div class="dialog">
+              <div class="hd">
+                <strong>Dashboard Vorschau</strong>
+                <div class="tabs">
+                  <div class="tab" data-tab="overview" active>Overview</div>
+                  <div class="tab" data-tab="alerts">Alerts</div>
+                  <div class="tab" data-tab="messages">Messages</div>
+                  <div class="tab" data-tab="reports">Reports</div>
+                  <div class="tab" data-tab="intel">Intel</div>
+                  <div class="tab" data-tab="ai_summary">AI‑Kurzfassung</div>
+                  <div class="tab" data-tab="ai_deep">AI‑Deep‑Dive</div>
+                </div>
+                <button class="btn" id="btnCloseModal">✖</button>
+              </div>
+              <div class="bd">
+                <div id="tab-overview"></div>
+                <div id="tab-alerts" style="display:none;"></div>
+                <div id="tab-messages" style="display:none;"></div>
+                <div id="tab-reports" style="display:none;"></div>
+                <div id="tab-intel" style="display:none;"></div>
+                <div id="tab-ai_summary" style="display:none;"></div>
+                <div id="tab-ai_deep" style="display:none;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+
+      // Bind
+      this.statusEl = this.$('#status');
+      this.progressWrap = this.$('#progressWrap');
+      this.progressBar = this.$('#progressBar');
+      this.progressText = this.$('#progressText');
+
+      this.btnCrawl = this.$('#btnCrawl');
+      this.btnStop = this.$('#btnStop');
+      this.btnPreview = this.$('#btnPreview');
+      this.btnAnalyze = this.$('#btnAnalyze');
+      this.btnAiSettings = this.$('#btnAiSettings');
+
+      this.chkAuto = this.$('#chkAuto');
+      this.selTheme = this.$('#selTheme');
+      this.selHours = this.$('#selHours');
+      this.sliderPages = this.$('#rngPages');
+      this.sliderParallel = this.$('#rngParallel');
+
+      // Init values
+      this.$('.ui').setAttribute('data-theme', this.settings.theme);
+      this.selTheme.value = this.settings.theme;
+      this.selHours.value = String(this.settings.onlyNewSinceHours || 0);
+      this.chkAuto.checked = this.settings.persistAuto ? (lsGet(LS.auto, false) === true) : false;
+      this.$('#aiEvery').value = String(this.settings.aiAutoMinutes);
+
+      // Events
+      this.btnCrawl.addEventListener('click', () => this._startCrawl());
+      this.btnStop.addEventListener('click', () => this._stopCrawl());
+      this.btnPreview.addEventListener('click', () => this._openPreview());
+      this.btnAnalyze.addEventListener('click', () => this._runAiAnalysis(true));
+      this.btnAiSettings.addEventListener('click', () => this._openAiSettings());
+
+      this.selTheme.addEventListener('change', () => { this.settings.theme = this.selTheme.value; this.$('.ui').setAttribute('data-theme', this.settings.theme); this._saveSettings(); });
+      this.selHours.addEventListener('change', () => { this.settings.onlyNewSinceHours = parseInt(this.selHours.value, 10) || 0; this._saveSettings(); });
+      this.sliderPages.addEventListener('input', () => { this.settings.maxPagesPerThread = parseInt(this.sliderPages.value, 10); this.$('#rngPagesVal').textContent = `${this.settings.maxPagesPerThread}`; this._saveSettings(); });
+      this.sliderParallel.addEventListener('input', () => { this.settings.batchSize = parseInt(this.sliderParallel.value, 10); this.$('#rngParallelVal').textContent = `${this.settings.batchSize}`; this._saveSettings(); });
+
+      this.$('#aiEvery').addEventListener('change', () => {
+        const v = clamp(parseInt(this.$('#aiEvery').value, 10) || 5, 1, 60);
+        this.$('#aiEvery').value = String(v);
+        this.settings.aiAutoMinutes = v; this._saveSettings();
+        if (this.chkAuto.checked) this._restartAuto();
+      });
+
+      this.chkAuto.addEventListener('change', () => {
+        if (this.chkAuto.checked) {
+          this._restartAuto();
+          if (this.settings.persistAuto) lsSet(LS.auto, true);
+          this._setStatus('Auto‑KI aktiviert.');
+        } else {
+          clearInterval(this.autoInterval);
+          if (this.settings.persistAuto) lsSet(LS.auto, false);
+          this._setStatus('Auto‑KI deaktiviert.');
+        }
+      });
+
+      this.$('#btnCloseModal').addEventListener('click', () => this._closePreview());
+      this.root.querySelectorAll('.tab').forEach((tab) => {
+        tab.addEventListener('click', () => this._switchTab(tab.dataset.tab));
+      });
+
+      // Auto‑KI direkt starten?
+      if (this.chkAuto.checked) {
+        this._setStatus('Auto aktiv – initiales Crawlen & Analysieren …');
+        this._startCrawl({ thenAnalyze: true, autoMode: true });
+      }
+    }
+
+    _restartAuto() {
+      clearInterval(this.autoInterval);
+      const everyMs = (this.settings.aiAutoMinutes || 5) * 60_000;
+      this.autoInterval = setInterval(() => this._startCrawl({ thenAnalyze: true, autoMode: true }), everyMs);
+    }
+
+    async _startCrawl({ thenAnalyze = false, autoMode = false } = {}) {
+      if (this.crawling) return;
+      this.crawling = true;
+      this._toggleProgress(true, 0, 'Start …');
+      this.btnCrawl.disabled = true; this.btnStop.disabled = false;
+
+      try {
+        const data = await this.crawler.crawlAll({
+          autoMode,
+          onProgress: (done, total) => this._setProgress(done / total * 100, `${done}/${total} Threads`)
+        });
+        this._setStatus(`Fertig: ${data.overview.stats.totalMessages} Nachrichten erfasst.`);
+        if (thenAnalyze && this.settings.aiEnabled) {
+          await this._runAiAnalysis(false);
+        }
+      } catch (e) {
+        const msg = String(e?.message || e);
+        this._setStatus(/abgebrochen/i.test(msg) ? 'Crawlen abgebrochen.' : 'Fehler: ' + msg);
+      } finally {
+        this.crawling = false;
+        this.btnCrawl.disabled = false; this.btnStop.disabled = true;
+        this._toggleProgress(false);
+      }
+    }
+
+    _stopCrawl() { this.crawler.stop(); }
+
+    async _runAiAnalysis(showModalAfter = false) {
+      if (!this.settings.aiKey) {
+        alert('Bitte zuerst in den AI‑Einstellungen deinen OpenRouter API‑Key setzen.');
+        return;
+      }
+      this.btnAnalyze.disabled = true;
+      this._setStatus('Sende kompakte Daten an KI …');
+
+      try {
+        const payload = await this.crawler.buildPayload();
+        const { reused, result } = await this.ai.analyze(payload);
+        this._setStatus(reused ? 'AI: letzte Analyse wiederverwendet.' : 'AI: Analyse aktualisiert.');
+
+        // Notifikation bei High‑Threats
+        if (this.settings.aiNotify) {
+          const threats = (result.parsed?.threats || []);
+          const hi = threats.find(t => (t.severity || '').toLowerCase() === 'high');
+          if (hi) {
+            try {
+              GM_notification({
+                title: 'Stämme – Kritische Bedrohung',
+                text: (hi.where ? `${hi.type} @ ${hi.where}` : hi.type) + ' – siehe AI‑Tabs.',
+                timeout: 5000,
+              });
+            } catch {}
+          }
+        }
+
+        if (showModalAfter) this._openPreview(true);
+        else this._renderAiTabs(); // falls Modal schon offen
+      } catch (e) {
+        alert('AI‑Fehler: ' + (e.message || e));
+        this._setStatus('AI‑Fehler: ' + (e.message || e));
+      } finally {
+        this.btnAnalyze.disabled = false;
+      }
+    }
+
+    _openAiSettings() {
+      const key = prompt('OpenRouter API‑Key (openrouter.ai):', this.settings.aiKey || '');
+      if (key != null) this.settings.aiKey = key.trim();
+
+      const model = prompt('Modell (z. B. "openrouter/auto", "x-ai/grok-4-mini:free"):', this.settings.aiModel || 'openrouter/auto');
+      if (model != null) this.settings.aiModel = model.trim();
+
+      const anon = confirm('Anonymisierung aktivieren? (OK = AN, Abbrechen = AUS)');
+      this.settings.aiAnonymize = !!anon;
+
+      this._saveSettings();
+      alert('AI‑Einstellungen gespeichert.');
+    }
+
+    _openPreview(focusAi = false) {
+      this._renderCoreTabs();
+      this._renderAiTabs();
+      this.$('#modal').setAttribute('open', '');
+      if (focusAi) this._switchTab('ai_summary');
+    }
+    _closePreview() { this.$('#modal').removeAttribute('open'); }
+    _switchTab(name) {
+      this.root.querySelectorAll('.tab').forEach((t) => t.toggleAttribute('active', t.dataset.tab === name));
+      this.root.querySelectorAll('[id^="tab-"]').forEach((el) => el.style.display = 'none');
+      const pane = this.$(`#tab-${name}`);
+      if (pane) pane.style.display = '';
+    }
+
+    _renderCoreTabs() {
+      const d = this.crawler.dashboardData;
+      // Overview
+      this.$('#tab-overview').innerHTML = html`
+        <div class="subgrid">
+          <div class="card"><h4>Nachrichten</h4><div class="kpi">${d.overview.stats.totalMessages}</div><div class="muted">Gesamt gesammelt</div></div>
+          <div class="card"><h4>Schlachten</h4><div class="kpi">${d.overview.stats.totalBattles}</div><div class="muted">Erkannte Berichte</div></div>
+          <div class="card"><h4>Spieler</h4><div class="kpi">${(d.overview.stats.activePlayers||[]).length}</div><div class="muted">Aktiv in Posts</div></div>
+          <div class="card"><h4>Zuletzt aktualisiert</h4><div class="kpi small">${d.overview.stats.lastUpdate}</div></div>
+        </div>
+      `;
+      // Alerts
+      const alerts = (d.overview.alerts||[]).map((a) => {
+        const kind = a.type === 'critical_battle' ? 'err' : 'warn';
+        return html`<tr>
+          <td><span class="pill ${kind}">${a.type}</span></td>
+          <td>${a.date || ''}</td>
+          <td>${a.author || ''}</td>
+          <td class="muted">${(a.coords || '')}</td>
+        </tr>`;
+      }).join('');
+      this.$('#tab-alerts').innerHTML = html`
+        <div class="card">
+          <h4>Alerts</h4>
+          <table>
+            <thead><tr><th>Typ</th><th>Datum</th><th>Autor</th><th>Koords</th></tr></thead>
+            <tbody>${alerts || `<tr><td colspan="4" class="muted">Keine Alerts</td></tr>`}</tbody>
+          </table>
+        </div>
+      `;
+      // Messages (letzte 300)
+      const msgs = (d.messages||[]).slice(-300).reverse().map((m) => html`
+        <tr>
+          <td>${m.date || ''}</td>
+          <td><span class="pill">${m.type}</span></td>
+          <td><strong>${m.author || ''}</strong></td>
+          <td class="muted">${(m.content || '').slice(0, 220)}${(m.content||'').length>220?'…':''}</td>
+        </tr>
+      `).join('');
+      this.$('#tab-messages').innerHTML = html`
+        <div class="card"><h4>Neueste Nachrichten</h4>
+          <table>
+            <thead><tr><th>Datum</th><th>Typ</th><th>Autor</th><th>Inhalt</th></tr></thead>
+            <tbody>${msgs || `<tr><td colspan="4" class="muted">Keine Nachrichten</td></tr>`}</tbody>
+          </table>
+        </div>
+      `;
+      // Reports (KPIs)
+      this.$('#tab-reports').innerHTML = html`
+        <div class="card">
+          <h4>Reports Überblick</h4>
+          <div class="kv"><span>Schlachten</span><code>${d.reports?.battles?.length || 0}</code></div>
+          <div class="kv"><span>Spionage</span><code>${d.reports?.spy?.length || 0}</code></div>
+          <div class="kv"><span>Bewegungen</span><code>${d.reports?.movements?.length || 0}</code></div>
+          <div class="kv"><span>Gebäude‑Changes</span><code>${d.reports?.buildingChanges?.length || 0}</code></div>
+          <div class="kv"><span>Handel</span><code>${d.reports?.trades?.length || 0}</code></div>
+        </div>
+      `;
+      // Intel (kompakt)
+      const villages = Object.entries(d.intel.villageInfo || {}).slice(0, 300).map(([coord, info]) => html`
+        <tr><td><code>${coord}</code></td><td class="muted">${info.lastUpdate || ''}</td><td>${info.resources ? `${info.resources.wood}/${info.resources.clay}/${info.resources.iron}` : ''}</td><td class="muted">${Object.keys(info.buildings||{}).length}</td></tr>
+      `).join('');
+      this.$('#tab-intel').innerHTML = html`
+        <div class="card">
+          <h4>Dorf-Intel</h4>
+          <table><thead><tr><th>Koords</th><th>Update</th><th>Ressourcen</th><th>#Gebäude</th></tr></thead>
+          <tbody>${villages || `<tr><td colspan="4" class="muted">–</td></tr>`}</tbody></table>
+        </div>
+      `;
+    }
+
+    _renderAiTabs() {
+      const ai = this.ai.lastAi;
+      const tabS = this.$('#tab-ai_summary');
+      const tabD = this.$('#tab-ai_deep');
+      if (!tabS || !tabD) return;
+
+      const escapeHtml = (s) => ('' + (s ?? '')).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+
+      if (!ai || !ai.parsed) {
+        tabS.innerHTML = '<div class="card"><h4>AI‑Kurzfassung</h4><div class="muted">Keine Analyse vorhanden. Klicke „🤖 KI analysieren“.</div></div>';
+        tabD.innerHTML = '<div class="card"><h4>AI‑Deep‑Dive</h4><div class="muted">Keine Analyse vorhanden.</div></div>';
+        return;
+      }
+
+      const p = ai.parsed;
+
+      // Summary-Tab (laienfreundlich + Highlights + Vertrauen)
+      const highlights = (p.highlights || []).map(x => `<li>${escapeHtml(x)}</li>`).join('') || '<li class="muted">–</li>';
+      tabS.innerHTML = `
+        <div class="card">
+          <h4>Für Außenstehende erklärt <span class="muted">(zuletzt: ${ai.at})</span></h4>
+          <p>${escapeHtml(p.summary_plain || p.summary || '')}</p>
+          <div class="subgrid">
+            <div><h4>Highlights</h4><ul>${highlights}</ul></div>
+            <div>
+              <h4>Vertrauen</h4>
+              <div class="kpi">${Math.round((p.confidence || 0) * 100)}%</div>
+            </div>
+          </div>
+        </div>
+      `;
+
+      // Deep-Dive (Warum wichtig, Aktionen, Bedrohungen, Intel-Änderungen, Glossar)
+      const why = (p.why_it_matters || []).map(x => `<li>${escapeHtml(x)}</li>`).join('') || '<li class="muted">–</li>';
+
+      const acts = (p.actions || []).map(a => `
+        <tr>
+          <td>${escapeHtml(a.title || '')}</td>
+          <td><span class="pill ${lvl(a.priority)}">${escapeHtml(a.priority || '')}</span></td>
+          <td class="muted">${(a.coords || []).map(escapeHtml).join(', ')}</td>
+          <td class="muted">${escapeHtml(a.deadline || '')}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="4" class="muted">–</td></tr>';
+
+      const thr = (p.threats || []).map(t => `
+        <tr>
+          <td>${escapeHtml(t.type || '')}</td>
+          <td><span class="pill ${sev(t.severity)}">${escapeHtml(t.severity || '')}</span></td>
+          <td>${escapeHtml(t.where || '')}</td>
+          <td class="muted">${escapeHtml(t.evidence || '')}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="4" class="muted">–</td></tr>';
+
+      const intel = (p.intel_changes || []).map(i => `<li><code>${escapeHtml(i.coord || '')}</code> – ${escapeHtml(i.change || '')}</li>`).join('') || '<li class="muted">–</li>';
+
+      const gloss = (p.glossary || []).map(g => `<li><strong>${escapeHtml(g.term || '')}:</strong> ${escapeHtml(g.meaning || '')}</li>`).join('') || '<li class="muted">–</li>';
+
+      tabD.innerHTML = `
+        <div class="card">
+          <h4>Warum das wichtig ist</h4>
+          <ul>${why}</ul>
+        </div>
+
+        <div class="card">
+          <h4>Konkrete Schritte</h4>
+          <table>
+            <thead><tr><th>Aktion</th><th>Prio</th><th>Koords</th><th>Frist</th></tr></thead>
+            <tbody>${acts}</tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h4>Bedrohungen</h4>
+          <table>
+            <thead><tr><th>Typ</th><th>Stufe</th><th>Ort</th><th>Beleg</th></tr></thead>
+            <tbody>${thr}</tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h4>Intel‑Änderungen</h4>
+          <ul>${intel}</ul>
+        </div>
+
+        <div class="card">
+          <h4>Glossar (ohne Jargon)</h4>
+          <ul>${gloss}</ul>
+        </div>
+      `;
+
+      function lvl(p) { return (p === 'high') ? 'err' : (p === 'med' ? 'warn' : 'ok'); }
+      function sev(s) { return (s === 'high') ? 'err' : (s === 'med' ? 'warn' : 'ok'); }
+    }
+
+    // --- Helpers UI ---
+    _toggleProgress(show, pct = 0, label = '') {
+      this.progressWrap.style.display = show ? '' : 'none';
+      if (show) this._setProgress(pct, label);
+    }
+    _setProgress(pct, label = '') {
+      const p = clamp(pct, 0, 100);
+      this.progressBar.style.width = `${p}%`;
+      this.progressText.textContent = label || `${Math.round(p)}%`;
+    }
+    _setStatus(msg) { if (this.statusEl) this.statusEl.textContent = msg; }
+  }
+
+  // Bootstrap
+  new App();
+
+})();
