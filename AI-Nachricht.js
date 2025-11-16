@@ -107,7 +107,7 @@
       const ihrMatches = (text.match(/\b(ihr|euch|euer|eure|euren|eurem|eurer|habt|seid|könnt|wollt|sollt|müsst)\b/g) || []).length;
 
       // "Sie"-Form Indikatoren (großgeschrieben!)
-      const sieMatches = (msg.text.match(/\b(Sie|Ihnen|Ihr|Ihre|Ihren|Ihrem|Ihrer|haben|sind|können|wollen|sollen|müssen)\b/g) || []).length;
+      const sieMatches = (msg.text.match(/\b(Sie|Ihnen|Ihr|Ihre|Ihren|Ihrem|Ihrer)\b/g) || []).length;
 
       duScore += duMatches;
       ihrScore += ihrMatches;
