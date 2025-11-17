@@ -35,6 +35,9 @@
   - [🌾 Kumin Farm](#-kumin-farm)
   - [📨 Auto Command Sender](#-auto-command-sender)
   - [🗺️ Tribeless Player Finder](#️-show-nearby-tribeless-players)
+  - [📊 Berichte Exportierer](#-die-stämme-berichte-exportierer)
+  - [🎯 Report zu Simulator](#-tw-report--simulator)
+  - [🚀 TWscripts Schnellleiste Auto-Importer](#-twscripts--stämme-schnellleiste-auto-importer)
 - [🤝 Beitragen](#-beitragen)
 - [📄 Lizenz](#-lizenz)
 - [⭐ Support](#-support)
@@ -552,6 +555,135 @@ Zeigt **stammeslose Spieler in der Nähe** deiner Dörfer an - perfekt für Rekr
 - 🎯 Schnelle Ziel-Identifikation
 
 **Perfekt für:** Rekrutierung, Expansion, Farming-Ziele
+
+---
+
+### 📊 Die Stämme Berichte Exportierer
+
+<img src="https://img.shields.io/badge/Status-Aktiv-success"/> <img src="https://img.shields.io/badge/KI-Nicht_Erforderlich-green"/> <img src="https://img.shields.io/badge/Kategorie-Export-teal"/>
+
+Exportiere **ausgewählte Berichte als BB-Code-Spoiler** mit informativen Titeln – perfekt für die Weitergabe im Forum oder in Stammes-Chats.
+
+<details>
+<summary><b>🔍 Funktionen im Detail</b></summary>
+
+<br>
+
+#### 📋 Massenexport
+- ✅ Wähle mehrere Berichte auf einmal aus
+- ✅ Exportiert alle ausgewählten Berichte in einem Durchgang
+- ✅ Batch-Verarbeitung für Effizienz
+
+#### 🎨 BB-Code-Formatierung
+- ✅ Erstellt automatisch BB-Code-Spoiler
+- ✅ Kurze, informative Titel für jeden Bericht
+- ✅ Bereit zum direkten Einfügen ins Forum
+
+#### 💾 Ein-Klick-Export
+- Fügt einen "Spoiler Exportieren"-Button zur Berichts-Übersicht hinzu
+- Modernes Design, integriert sich nahtlos ins Spiel
+- Ergebnis direkt in die Zwischenablage kopierbar
+
+#### ⚙️ Features
+- Automatische Fehlerbehandlung
+- Progress-Anzeige während des Exports
+- Unterstützt alle Berichtstypen
+
+</details>
+
+**Perfekt für:** Stammes-Koordination, Berichte teilen, Forum-Posts
+
+---
+
+### 🎯 TW Report → Simulator
+
+<img src="https://img.shields.io/badge/Status-Aktiv-success"/> <img src="https://img.shields.io/badge/KI-Nicht_Erforderlich-green"/> <img src="https://img.shields.io/badge/Kategorie-Werkzeug-gray"/>
+
+Übertrage **Kampfberichte direkt in den Simulator** – spart Zeit und ermöglicht schnelle Analysen und Re-Simulationen.
+
+<details>
+<summary><b>🔍 Funktionen im Detail</b></summary>
+
+<br>
+
+#### ⚡ Schnelle Datenübertragung
+- ✅ Überträgt Angreifer- und Verteidiger-Truppen automatisch
+- ✅ Erkennt Einheiten aus Report-HTML oder Text
+- ✅ Unterstützt Überlebende, Verluste und ursprüngliche Truppen
+
+#### 🎯 Erweiterte Werte
+Überträgt automatisch:
+- 🎲 **Glück** (Luck)
+- 🛡️ **Moral** (Morale)
+- 🏰 **Mauer-Level** (Wall)
+- 💥 **Gebäudeschaden** (aus Rammbock-Berichten)
+
+#### ⌨️ Hotkey-Unterstützung
+- **Shift**: Nur Überlebende übertragen
+- **Alt**: Nur Verteidiger übertragen
+- **Strg/Cmd**: Beide Seiten gleichzeitig
+
+#### 🌍 Mehrsprachig
+Unterstützt viele Sprachen:
+- 🇩🇪 Deutsch
+- 🇬🇧 Englisch
+- 🇫🇷 Französisch
+- 🇪🇸 Spanisch
+- und weitere...
+
+#### 🎨 Benutzerfreundlich
+- Toast-Benachrichtigungen bei erfolgreicher Übertragung
+- Visuelle Hervorhebung der befüllten Felder
+- Robuste Fehlerbehandlung
+
+</details>
+
+**Perfekt für:** Kampfanalyse, Strategie-Planung, schnelle Simulationen
+
+---
+
+### 🚀 TWscripts → Stämme Schnellleiste Auto-Importer
+
+<img src="https://img.shields.io/badge/Status-Aktiv-success"/> <img src="https://img.shields.io/badge/KI-Nicht_Erforderlich-green"/> <img src="https://img.shields.io/badge/Kategorie-Werkzeug-gray"/>
+
+Importiere **Scripts von twscripts.dev automatisch** in deine Stämme-Schnellleiste – mit deutscher Beschriftung und intelligenter Gruppierung.
+
+<details>
+<summary><b>🔍 Funktionen im Detail</b></summary>
+
+<br>
+
+#### 🔄 Automatischer Import
+- ✅ Sammelt Loader-Scripts von twscripts.dev
+- ✅ Fügt sie automatisch zur Schnellleiste hinzu
+- ✅ Deutsche Benennungen für bessere Übersicht
+
+#### 🎨 Intelligente Organisation
+- ✅ Gruppiert Scripts nach Kategorien
+- ✅ Fügt Trennlinien zwischen Gruppen ein
+- ✅ Anpassbare Einträge pro Zeile (Standard: 7)
+
+#### ⚙️ Erweiterte Konfiguration
+Anpassbare Einstellungen:
+- 🔢 **Concurrency**: Gleichzeitige Anfragen (Standard: 5)
+- ⏱️ **Delay**: Verzögerung zwischen Anfragen (Standard: 2500ms)
+- 🎲 **Jitter**: Zufällige Verzögerung (Standard: 700ms)
+- 🔁 **Max Retries**: Maximale Wiederholungen (Standard: 3)
+
+#### 🛡️ Sicherheit & Performance
+- ✅ Überspringt automatisch Duplikate
+- ✅ Exponential Backoff bei Fehlern
+- ✅ Progress-Anzeige während des Imports
+- ✅ CSP-freundliche Implementierung
+
+#### 🎮 Polierte UI
+- Moderne Benutzeroberfläche mit Theme-Unterstützung (Auto/Light/Dark)
+- Diagnose-Funktionen für Fehlersuche
+- Konfigurierbar über Tampermonkey-Menü
+
+</details>
+
+**Perfekt für:** Script-Verwaltung, schneller Zugriff auf TWscripts.dev-Tools, Organisation
 
 ---
 
