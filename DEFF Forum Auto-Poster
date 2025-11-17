@@ -1,0 +1,529 @@
+// ==UserScript==
+// @name         Tribal Wars - DEFF Forum Auto-Poster (verbessert)
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  Postet Unterstützungsanfragen automatisch ins DEFF-Forum mit intelligenter Typ-Erkennung und Vorschau
+// @author       Themegaindex
+// @match        https://*.die-staemme.de/game.php*screen=reqdef*
+// @match        https://*.die-staemme.de/game.php*screen=forum*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ==================== KONFIGURATION ====================
+    const CONFIG = {
+        FORUM_ID: '1409',             // ID des DEFF Forums
+        AUTO_DETECT_TYPE: true,       // Automatische Typ-Erkennung
+        SHOW_PREVIEW: true,           // Forum Vorschau nach Auto-Fill
+        BUTTON_COLOR: '#8B4513'       // Button-Farbe
+    };
+
+    // ==================== KONSTANTEN ====================
+    const PENDING_POST_TIMEOUT = 30000;   // 30 Sekunden
+    const AUTOFILL_INTERVAL = 100;        // 100 ms
+    const AUTOFILL_MAX_WAIT = 10000;      // 10 Sekunden
+    const FORM_CHECK_MAX_WAIT = 5000;     // 5 Sekunden
+
+    // ==================== TEMPLATES ====================
+    // Texte sind bewusst etwas klarer und leichter abgestuft
+    const TEMPLATES = {
+        NORMAL: {
+            name: 'Normaler Angriff',
+            icon: '⚔️',
+            priority: 'Normal',
+            color: '#FFD700',
+            header:
+                '[b][size=12]⚔️ DEFF BENÖTIGT[/size][/b]\n\n' +
+                'Es wird reguläre Unterstützung benötigt.\n' +
+                'Bitte so schnell wie möglich Deff schicken.\n\n',
+            footer:
+                '\n\n[b]Status:[/b] ⏳ Wartet auf Unterstützung\n' +
+                '[b]Priorität:[/b] Normal'
+        },
+        FAKE: {
+            name: 'Vermutlicher Fake',
+            icon: '👀',
+            priority: 'Niedrig',
+            color: '#90EE90',
+            header:
+                '[b]ℹ️ Vermutlich ein Fake[/b]\n\n' +
+                'Der Angriff wirkt eher klein und sieht nach Fake aus.\n' +
+                'Trotzdem bitte im Auge behalten und bei Bedarf reagieren.\n\n',
+            footer:
+                '\n\n[b]Status:[/b] 👀 Beobachten\n' +
+                '[b]Priorität:[/b] Niedrig'
+        },
+        OFF: {
+            name: 'Starker Off-Angriff',
+            icon: '🚨',
+            priority: 'Hoch',
+            color: '#FF6347',
+            header:
+                '[b][color=red][size=14]🚨 STARKER OFF ANGRIFF 🚨[/size][/color][/b]\n\n' +
+                'Es läuft ein größerer Off-Angriff ein.\n' +
+                'Bitte schnell und koordiniert Deff schicken.\n\n',
+            footer:
+                '\n\n[b]Status:[/b] 🔴 Dringend\n' +
+                '[b]Priorität:[/b] Hoch'
+        },
+        ADEL: {
+            name: 'Adelsangriff',
+            icon: '👑',
+            priority: 'Kritisch',
+            color: '#DC143C',
+            header:
+                '[b][color=red][size=16]👑 ADELUNGSVERSUCH 👑[/size][/color][/b]\n\n' +
+                'Es wurde ein Adelsangriff erkannt.\n' +
+                'Maximale Verteidigung wird benötigt.\n' +
+                'Wenn möglich, eigene AGs im Dorf lassen und schnell stacken.\n\n',
+            footer:
+                '\n\n[b]Status:[/b] 🔴 Kritisch\n' +
+                '[b]Priorität:[/b] Sehr hoch\n' +
+                '[b]Hinweis:[/b] AGs möglichst im Dorf halten.'
+        }
+    };
+
+    // ==================== HILFSFUNKTIONEN ====================
+
+    function isReqDefPage() {
+        const href = window.location.href;
+        return href.includes('screen=reqdef');
+    }
+
+    function isNewThreadPage() {
+        const href = window.location.href;
+        return href.includes('screen=forum') && href.includes('mode=new_thread');
+    }
+
+    // Extrahiert Koordinaten aus BB-Code
+    function extractCoords(text) {
+        const match = text.match(/\[coord\]([0-9]{3}\|[0-9]{3})\[\/coord\]/);
+        return match ? match[1] : '???|???';
+    }
+
+    // Extrahiert Ankunftszeit (nur Uhrzeit für den Titel)
+    function extractArrivalTime(text) {
+        // Akzeptiert "Ankunft:", "Ankunftszeit:" etc
+        const match = text.match(/Ankunfts?(zeit)?:\s*([0-9.]+\s+[0-9:]+)/i);
+        if (!match) return 'unbekannt';
+
+        const timeMatch = match[2].match(/([0-9]{1,2}:[0-9]{2}:[0-9]{2})/);
+        return timeMatch ? timeMatch[1] : 'unbekannt';
+    }
+
+    // Erkennt Angriffstyp automatisch anhand Einheiten
+    function detectAttackType(text) {
+        // Adelsangriff klar erkennen
+        if (/\[unit\]snob\[\/unit\]/i.test(text) || text.includes('Adelsgeschlecht')) {
+            return 'ADEL';
+        }
+
+        const unitRegex = /\[unit\]([a-z_]+)\[\/unit\]\s*(\d+)/gi;
+        let match;
+        let totalUnits = 0;
+        let offUnits = 0;
+
+        const OFF_UNITS = ['axe', 'light', 'marcher', 'ram', 'catapult'];
+        // Optional defensive Einheiten, falls du sie später auswerten willst
+        // const DEF_UNITS = ['spear', 'sword', 'heavy'];
+
+        while ((match = unitRegex.exec(text)) !== null) {
+            const unitName = match[1];
+            const count = parseInt(match[2], 10) || 0;
+            totalUnits += count;
+            if (OFF_UNITS.includes(unitName)) {
+                offUnits += count;
+            }
+        }
+
+        if (totalUnits === 0) {
+            // Keine Einheiten im Text gefunden
+            return 'NORMAL';
+        }
+
+        const offRatio = offUnits / totalUnits;
+
+        // Deutlicher Off
+        if (offUnits >= 800 && offRatio > 0.6) {
+            return 'OFF';
+        }
+
+        // Wahrscheinlicher Fake: sehr wenige Einheiten und kaum Off
+        if (totalUnits < 100 && offUnits < 50) {
+            return 'FAKE';
+        }
+
+        // Default Fall
+        return 'NORMAL';
+    }
+
+    // Generiert Post-Titel
+    function generateTitle(coords, time, type) {
+        const template = TEMPLATES[type] || TEMPLATES.NORMAL;
+        const typeLabelMap = {
+            ADEL: 'ADEL',
+            OFF: 'OFF',
+            FAKE: 'FAKE',
+            NORMAL: 'DEFF'
+        };
+        const typeLabel = typeLabelMap[type] || 'DEFF';
+        const prefix = template.icon ? template.icon + ' ' : '';
+        const timePart = time && time !== 'unbekannt' ? ' - Angriff um ' + time : '';
+        return prefix + '[' + typeLabel + '] ' + coords + timePart;
+    }
+
+    // Generiert vollständigen Post-Text
+    function generatePost(template, originalText) {
+        return template.header + originalText + template.footer;
+    }
+
+    // ==================== UI MODAL ====================
+    function createModal(coords, time, originalText, detectedType) {
+        // Entferne existierendes Modal falls vorhanden
+        const existing = document.getElementById('deff-poster-modal');
+        if (existing) existing.remove();
+
+        // Modal-Container
+        const modal = document.createElement('div');
+        modal.id = 'deff-poster-modal';
+        modal.style.cssText =
+            'position: fixed;' +
+            'top: 0;' +
+            'left: 0;' +
+            'width: 100%;' +
+            'height: 100%;' +
+            'background: rgba(0,0,0,0.7);' +
+            'z-index: 99999;' +
+            'display: flex;' +
+            'justify-content: center;' +
+            'align-items: center;';
+
+        // Modal-Inhalt
+        const content = document.createElement('div');
+        content.style.cssText =
+            'background: #f4e4bc;' +
+            'border: 2px solid #7d510f;' +
+            'padding: 20px;' +
+            'max-width: 800px;' +
+            'max-height: 90vh;' +
+            'overflow-y: auto;' +
+            'box-shadow: 0 0 20px rgba(0,0,0,0.5);';
+
+        // Überschrift
+        const title = document.createElement('h2');
+        title.textContent = 'Ins DEFF-Forum posten';
+        title.style.cssText = 'margin: 0 0 20px 0; color: #7d510f;';
+        content.appendChild(title);
+
+        // Template-Auswahl
+        const templateSection = document.createElement('div');
+        templateSection.innerHTML = '<strong>Wähle Angriffstyp:</strong>';
+        templateSection.style.marginBottom = '15px';
+
+        const templateContainer = document.createElement('div');
+        templateContainer.style.cssText =
+            'display: grid;' +
+            'grid-template-columns: repeat(2, 1fr);' +
+            'gap: 10px;' +
+            'margin-top: 10px;';
+
+        let lastType = GM_getValue('lastAttackType');
+        let selectedType = lastType && TEMPLATES[lastType] ? lastType : detectedType;
+
+        const buttons = {};
+
+        function refreshButtonStyles() {
+            Object.keys(buttons).forEach(function(type) {
+                const btn = buttons[type];
+                if (!btn) return;
+                if (type === selectedType) {
+                    btn.style.background = TEMPLATES[type].color;
+                    btn.style.fontWeight = 'bold';
+                } else {
+                    btn.style.background = '#DEB887';
+                    btn.style.fontWeight = 'normal';
+                }
+            });
+        }
+
+        Object.keys(TEMPLATES).forEach(function(type) {
+            const btn = document.createElement('button');
+            btn.className = 'btn';
+            btn.innerHTML = TEMPLATES[type].icon + ' ' + TEMPLATES[type].name;
+            btn.style.cssText =
+                'padding: 10px;' +
+                'border: 2px solid #7d510f;' +
+                'cursor: pointer;' +
+                'font-size: 14px;' +
+                'transition: all 0.2s;';
+
+            btn.onclick = function() {
+                selectedType = type;
+                GM_setValue('lastAttackType', type);
+                refreshButtonStyles();
+                updatePreview();
+            };
+
+            buttons[type] = btn;
+            templateContainer.appendChild(btn);
+        });
+
+        refreshButtonStyles();
+        templateSection.appendChild(templateContainer);
+        content.appendChild(templateSection);
+
+        // Vorschau
+        const previewSection = document.createElement('div');
+        previewSection.style.cssText = 'margin-top: 20px;';
+        previewSection.innerHTML = '<strong>Vorschau:</strong>';
+
+        const previewBox = document.createElement('div');
+        previewBox.id = 'post-preview';
+        previewBox.style.cssText =
+            'background: white;' +
+            'border: 1px solid #7d510f;' +
+            'padding: 15px;' +
+            'margin-top: 10px;' +
+            'max-height: 300px;' +
+            'overflow-y: auto;' +
+            'font-family: monospace;' +
+            'white-space: pre-wrap;' +
+            'font-size: 12px;';
+
+        previewSection.appendChild(previewBox);
+        content.appendChild(previewSection);
+
+        // Update Vorschau Funktion
+        function updatePreview() {
+            const template = TEMPLATES[selectedType] || TEMPLATES.NORMAL;
+            const fullText = generatePost(template, originalText);
+            const titleText = generateTitle(coords, time, selectedType);
+
+            previewBox.innerHTML =
+                '<strong style="color: #7d510f;">Titel:</strong> ' + titleText +
+                '<hr style="border-color: #7d510f; margin: 10px 0;">' +
+                '<strong style="color: #7d510f;">Inhalt:</strong><br>' +
+                fullText.replace(/\n/g, '<br>');
+        }
+
+        updatePreview();
+
+        // Buttons
+        const buttonContainer = document.createElement('div');
+        buttonContainer.style.cssText =
+            'margin-top: 20px;' +
+            'display: flex;' +
+            'gap: 10px;' +
+            'justify-content: flex-end;';
+
+        function closeModal() {
+            modal.remove();
+            document.removeEventListener('keydown', onKeyDown);
+        }
+
+        function onKeyDown(e) {
+            if (e.key === 'Escape') {
+                closeModal();
+            }
+        }
+
+        document.addEventListener('keydown', onKeyDown);
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn';
+        cancelBtn.textContent = 'Abbrechen';
+        cancelBtn.onclick = function() {
+            closeModal();
+        };
+
+        const postBtn = document.createElement('button');
+        postBtn.className = 'btn';
+        postBtn.textContent = '🚀 Ins Forum posten';
+        postBtn.style.cssText = 'background: #8B4513; color: white; font-weight: bold;';
+        postBtn.onclick = function() {
+            postToForum(coords, time, originalText, selectedType);
+            closeModal();
+        };
+
+        buttonContainer.appendChild(cancelBtn);
+        buttonContainer.appendChild(postBtn);
+        content.appendChild(buttonContainer);
+
+        modal.appendChild(content);
+        document.body.appendChild(modal);
+
+        // Schließen bei Klick außerhalb
+        modal.onclick = function(e) {
+            if (e.target === modal) {
+                closeModal();
+            }
+        };
+    }
+
+    // ==================== FORUM POSTING ====================
+    function postToForum(coords, time, originalText, attackType) {
+        const template = TEMPLATES[attackType] || TEMPLATES.NORMAL;
+        const title = generateTitle(coords, time, attackType);
+        const fullText = generatePost(template, originalText);
+
+        // Daten für das Forum-Fenster speichern
+        GM_setValue('pendingPost', {
+            title: title,
+            text: fullText,
+            timestamp: Date.now()
+        });
+
+        // Forum in neuem Tab öffnen
+        const url = new URL(window.location.href);
+        const baseUrl = url.origin + url.pathname;
+        const village = url.searchParams.get('village') || '';
+
+        const forumUrl =
+            baseUrl +
+            '?village=' + encodeURIComponent(village) +
+            '&screen=forum&screenmode=view_forum&forum_id=' +
+            encodeURIComponent(CONFIG.FORUM_ID) +
+            '&mode=new_thread';
+
+        window.open(forumUrl, '_blank');
+    }
+
+    // ==================== FORUM AUTO-FILL ====================
+    function autoFillForum() {
+        const pending = GM_getValue('pendingPost');
+        if (!pending) return;
+
+        // Prüfe ob nicht älter als 30 Sekunden
+        if (Date.now() - pending.timestamp > PENDING_POST_TIMEOUT) {
+            GM_setValue('pendingPost', null);
+            return;
+        }
+
+        const startTime = Date.now();
+
+        const checkInterval = setInterval(function() {
+            const now = Date.now();
+            if (now - startTime > AUTOFILL_MAX_WAIT) {
+                clearInterval(checkInterval);
+                GM_setValue('pendingPost', null);
+                return;
+            }
+
+            const titleInput = document.querySelector('input[name="subject"]');
+            const messageInput = document.querySelector('textarea#message');
+
+            if (titleInput && messageInput) {
+                clearInterval(checkInterval);
+
+                // Felder ausfüllen
+                titleInput.value = pending.title;
+                messageInput.value = pending.text;
+
+                // gespeicherte Daten löschen
+                GM_setValue('pendingPost', null);
+
+                // Vorschau klicken, wenn konfiguriert
+                if (CONFIG.SHOW_PREVIEW) {
+                    setTimeout(function() {
+                        const previewBtn = document.querySelector('input[name="preview"]');
+                        if (previewBtn) {
+                            previewBtn.click();
+                        }
+                    }, 500);
+                }
+
+                // Visuelles Feedback
+                const notice = document.createElement('div');
+                notice.style.cssText =
+                    'position: fixed;' +
+                    'top: 20px;' +
+                    'right: 20px;' +
+                    'background: #4CAF50;' +
+                    'color: white;' +
+                    'padding: 15px 20px;' +
+                    'border-radius: 5px;' +
+                    'z-index: 99999;' +
+                    'box-shadow: 0 2px 10px rgba(0,0,0,0.3);';
+                notice.textContent = '✓ Post automatisch eingefügt!';
+                document.body.appendChild(notice);
+
+                setTimeout(function() {
+                    notice.remove();
+                }, 3000);
+            }
+        }, AUTOFILL_INTERVAL);
+    }
+
+    // ==================== HAUPTFUNKTION ====================
+    function initReqDefPage() {
+        const startTime = Date.now();
+
+        const checkForm = setInterval(function() {
+            if (Date.now() - startTime > FORM_CHECK_MAX_WAIT) {
+                clearInterval(checkForm);
+                return;
+            }
+
+            // Such den "Text aktualisieren" Button etwas robuster
+            const submitButtons = Array.from(document.querySelectorAll('input[type="submit"]'));
+            const updateButton = submitButtons.find(function(btn) {
+                return /aktualisier/i.test(btn.value || '');
+            });
+
+            const messageTextarea = document.getElementById('message');
+
+            if (updateButton && messageTextarea && !document.getElementById('forum-post-btn')) {
+                clearInterval(checkForm);
+
+                // "Ins Forum posten" Button erstellen
+                const forumBtn = document.createElement('input');
+                forumBtn.id = 'forum-post-btn';
+                forumBtn.type = 'button';
+                forumBtn.className = 'btn';
+                forumBtn.value = '🚀 Ins Forum posten';
+                forumBtn.style.cssText =
+                    'background: ' + CONFIG.BUTTON_COLOR + ';' +
+                    'color: white;' +
+                    'font-weight: bold;' +
+                    'margin-left: 10px;';
+
+                forumBtn.onclick = function() {
+                    const text = messageTextarea.value;
+                    if (!text || !text.trim()) {
+                        alert('Kein Text vorhanden. Bitte zuerst "Text aktualisieren" klicken.');
+                        return;
+                    }
+
+                    const coords = extractCoords(text);
+                    const time = extractArrivalTime(text);
+                    const detectedType = CONFIG.AUTO_DETECT_TYPE ? detectAttackType(text) : 'NORMAL';
+
+                    createModal(coords, time, text, detectedType);
+                };
+
+                // Button nach "Text aktualisieren" einfügen
+                updateButton.parentNode.insertBefore(forumBtn, updateButton.nextSibling);
+            }
+        }, 100);
+    }
+
+    function init() {
+        if (isReqDefPage()) {
+            initReqDefPage();
+        }
+
+        if (isNewThreadPage()) {
+            autoFillForum();
+        }
+    }
+
+    // ==================== START ====================
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
