@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      3.3
 // @description  Kontext-Analyse, Caching, Queue + Token-Bucket, Retry-After, Free-Fallback-Modelle, Vorschau, Varianten, Shortcuts, Kurznotiz-Intents
-// @author       Du
+// @author       TheMegaindex
 // @match        https://*.die-staemme.de/game.php*
 // @grant        GM_setValue
 // @grant        GM_getValue
