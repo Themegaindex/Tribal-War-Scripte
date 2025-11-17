@@ -25,6 +25,7 @@
 - [📜 Skript-Übersicht](#-skript-übersicht)
   - [🤖 Forum Crawler – AI Dashboard](#-die-stämme-forum-crawler--ai-dashboard)
   - [✍️ AI-Nachricht](#️-ai-nachricht)
+  - [🛡️ DEFF Forum Auto-Poster](#️-deff-forum-auto-poster)
   - [🎯 Präzises Umbenennen](#-die-staemme---präzises-umbenennen-von-angriffen-und-support)
   - [🗺️ CustomMap](#️-custommap)
   - [⛏️ Raubzug](#️-raubzug)
@@ -272,6 +273,60 @@ Dieses Skript integriert eine **KI direkt in das Nachrichtensystem** von Die St�
 </details>
 
 **Perfekt für:** Diplomatie, schnelle Antworten, professionelle Kommunikation
+
+---
+
+### 🛡️ DEFF Forum Auto-Poster
+
+<img src="https://img.shields.io/badge/Status-Aktiv-success"/> <img src="https://img.shields.io/badge/KI-Nicht_Erforderlich-green"/> <img src="https://img.shields.io/badge/Kategorie-Automatisierung-orange"/>
+
+Automatisiere das **Posten von Verteidigungsanfragen** im Stammes-DEFF-Forum. Das Skript erkennt automatisch den Angriffstyp und erstellt passend formatierte Forum-Posts.
+
+<details>
+<summary><b>🔍 Funktionen im Detail</b></summary>
+
+<br>
+
+#### 🎯 Intelligente Typ-Erkennung
+Das Skript analysiert automatisch die Einheiten und kategorisiert Angriffe:
+- 👑 **Adelsangriff**: Kritische Priorität bei erkanntem AG
+- 🚨 **Starker Off-Angriff**: Hohe Priorität bei >800 Off-Einheiten
+- ⚔️ **Normaler Angriff**: Standard-Verteidigungsanfrage
+- 👀 **Vermutlicher Fake**: Niedrige Priorität bei kleinen Angriffen
+
+#### 📋 Template-System
+Vorkonfigurierte Templates für jeden Angriffstyp:
+- ✅ Passende Icons und Farben
+- ✅ Priorisierte Überschriften
+- ✅ Klare Handlungsanweisungen
+- ✅ Status-Informationen
+
+#### ⚡ Ein-Klick-Workflow
+- Fügt Button zur Unterstützungsanfrage-Seite hinzu
+- Extrahiert automatisch alle relevanten Daten:
+  - 📍 Koordinaten
+  - ⏰ Ankunftszeit
+  - 👥 Einheiten-Information
+  - 🏰 Dorfname
+- Erstellt vollständigen BB-Code-Post
+- Optional: Automatische Forum-Vorschau
+
+#### 🎨 Anpassbar
+Konfigurierbare Optionen:
+- 🎨 **Forum-ID**: Ziel-Forum anpassen
+- 🔧 **Auto-Detection**: Typ-Erkennung ein/aus
+- 👁️ **Vorschau**: Post-Vorschau aktivieren
+- 🎨 **Button-Farbe**: Visuelle Anpassung
+
+#### ⚙️ Smart Features
+- ✅ Verhindert Doppel-Posts
+- ✅ Timeout-Schutz (30 Sekunden)
+- ✅ Automatische BB-Code-Formatierung
+- ✅ Koordinaten-Integration
+
+</details>
+
+**Perfekt für:** Defensive Koordination, schnelle Reaktion, Stammes-Organisation
 
 ---
 
