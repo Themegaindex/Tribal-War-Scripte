@@ -1,0 +1,812 @@
+// ==UserScript==
+// @name         DS Auto-Notiz aus TWStats (Dorfseite, Button + Detailanalyse, Zahlenfix)
+// @namespace    https://die-staemme.de/
+// @version      0.8
+// @description  Fügt einen "TWStats"-Button in der Dorf-Notiz ein. Beim Klick wird eine detaillierte Analyse erstellt/aktualisiert (Aktivität / Off / Deff / Gefahr) und als BB-Code in die Notiz eingefügt. Behandelt auch TWStats-"k"/"m"-Abkürzungen korrekt.
+// @match        https://*.die-staemme.de/game.php*
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      de.twstats.com
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const MARKER = '[b][size=12]TWStats-Autoanalyse[/size][/b]';
+    const END_MARKER = '[i](Automatisch generiert aus TWStats – Richtwerte, ohne Gewähr.)[/i]';
+
+    let processing = false;
+
+    // -------------------------------------------------------------------------
+    // Logging helpers
+    // -------------------------------------------------------------------------
+
+    function log(...args)   { console.log('[Auto-TWStats]', ...args); }
+    function warn(...args)  { console.warn('[Auto-TWStats]', ...args); }
+    function error(...args) { console.error('[Auto-TWStats]', ...args); }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    // Neue, robuste Zahl-Parsing-Funktion:
+    // - unterstützt "14k", "14.3k", "2.5m"
+    // - normale Zahlen wie "30.831" werden korrekt als 30831 interpretiert
+    function parseStat(str) {
+        if (!str) return 0;
+        let s = String(str).trim();
+        if (!s) return 0;
+
+        // Normalisieren
+        s = s.replace(/\s+/g, '');
+        const lower = s.toLowerCase();
+
+        // Hat k oder m als Suffix?
+        const hasK = lower.includes('k');
+        const hasM = lower.includes('m');
+
+        if (hasK || hasM) {
+            let factor = hasM ? 1_000_000 : 1_000;
+
+            // nur Ziffern, Punkt, Komma behalten
+            let numStr = lower.replace(/[^0-9.,-]/g, '');
+            if (!numStr) return 0;
+
+            // Komma als Dezimalpunkt interpretieren
+            numStr = numStr.replace(',', '.');
+
+            const val = parseFloat(numStr);
+            if (isNaN(val)) return 0;
+
+            return Math.round(val * factor);
+        } else {
+            // Keine k/m-Abkürzung: . und , als Tausendertrenner entfernen
+            let numStr = lower.replace(/[.,]/g, '');
+            const val = parseInt(numStr, 10);
+            return isNaN(val) ? 0 : val;
+        }
+    }
+
+    function fmt(num) {
+        return num.toLocaleString('de-DE');
+    }
+
+    function color(text, col) {
+        return `[color=${col}]${text}[/color]`;
+    }
+
+    function getWorldFromHost() {
+        const host = window.location.host;
+        const m = host.match(/^([a-z0-9]+)\./i);
+        const world = m ? m[1] : null;
+        log('Host:', host, '-> World:', world);
+        return world;
+    }
+
+    function getPlayerIdFromPage() {
+        // 1) unsafeWindow.VillageInfo.player_id
+        try {
+            if (typeof unsafeWindow !== 'undefined' &&
+                unsafeWindow.VillageInfo &&
+                unsafeWindow.VillageInfo.player_id) {
+                const id = String(unsafeWindow.VillageInfo.player_id);
+                log('VillageInfo.player_id:', id);
+                return id;
+            }
+        } catch (e) {
+            warn('Zugriff auf unsafeWindow.VillageInfo fehlgeschlagen:', e);
+        }
+
+        // 2) Spieler-Zeile "Spieler:" im Info-Table
+        try {
+            const infoTables = document.querySelectorAll('#content_value table.vis');
+            for (const tbl of infoTables) {
+                const rows = tbl.querySelectorAll('tr');
+                for (const tr of rows) {
+                    const tds = tr.querySelectorAll('td');
+                    if (tds.length >= 2 && tds[0].textContent.trim() === 'Spieler:') {
+                        const a = tds[1].querySelector('a[href*="screen=info_player"]');
+                        if (a) {
+                            const url = new URL(a.href, window.location.origin);
+                            const id = url.searchParams.get('id');
+                            log('Player-URL (Spieler-Zeile):', url.href, '-> id:', id);
+                            if (id) return id;
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            warn('Fehler beim Parsen der Spieler-Zeile:', e);
+        }
+
+        // 3) Fallback: irgendein screen=info_player Link
+        try {
+            const link = document.querySelector('a[href*="screen=info_player"]');
+            if (link) {
+                const url = new URL(link.href, window.location.origin);
+                const id = url.searchParams.get('id');
+                log('Player-URL (Fallback):', url.href, '-> id:', id);
+                if (id) return id;
+            }
+        } catch (e) {
+            warn('Fehler im Fallback-Screen-Link:', e);
+        }
+
+        warn('Keine Spieler-ID gefunden (Barb oder Fehler).');
+        return null;
+    }
+
+    function gmGet(url) {
+        log('GM GET:', url);
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                onload: resp => {
+                    log('GM GET OK:', url, resp.status);
+                    resolve(resp.responseText);
+                },
+                onerror: err => {
+                    error('GM GET ERROR:', url, err);
+                    reject(err);
+                },
+            });
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // TWStats: Info-Tab
+    // -------------------------------------------------------------------------
+
+    function parseInfoDoc(doc) {
+        const res = {
+            name: '',
+            tribeTag: '',
+            rankPoints: null,
+            points: null,
+            villages: null,
+            avgPoints: null,
+            rankBG: null,
+            bg: null,
+            rankBGA: null,
+            bga: null,
+            rankBGV: null,
+            bgv: null,
+            registered: '',
+            otherWorlds: [],
+        };
+
+        const h3 = doc.querySelector('div.widget h3');
+        if (h3) {
+            const a = h3.querySelector('a[href*="page=player"]');
+            if (a) res.name = a.textContent.trim();
+        }
+
+        const rows = doc.querySelectorAll('table.profile tr');
+        rows.forEach(tr => {
+            const th = tr.querySelector('th');
+            const td = tr.querySelector('td');
+            if (!th || !td) return;
+            const key = th.textContent.trim().replace(':', '');
+
+            if (key === 'Rang') {
+                res.rankPoints = parseStat(td.textContent);
+            } else if (key === 'Name') {
+                res.name = td.textContent.trim();
+            } else if (key === 'Stamm') {
+                const a = td.querySelector('a.tribelink');
+                if (a) res.tribeTag = a.textContent.trim();
+            } else if (key === 'Punkte') {
+                res.points = parseStat(td.textContent);
+            } else if (key === 'Dörfer') {
+                res.villages = parseStat(td.textContent);
+            } else if (key.startsWith('Durchschnittliche Punktzahl')) {
+                res.avgPoints = parseStat(td.textContent);
+            } else if (key === 'BG Rangliste') {
+                // erlaubt auch "20.3k score"
+                const m = td.textContent.replace(/\s+/g, ' ')
+                    .match(/(\d+)\.\s*\(([\d\.,kmKM]+)\s+score\)/i);
+                if (m) {
+                    res.rankBG = parseStat(m[1]);
+                    res.bg = parseStat(m[2]);
+                }
+            } else if (key === 'BG Angreiferrangliste') {
+                const m = td.textContent.replace(/\s+/g, ' ')
+                    .match(/(\d+)\.\s*\(([\d\.,kmKM]+)\s+score\)/i);
+                if (m) {
+                    res.rankBGA = parseStat(m[1]);
+                    res.bga = parseStat(m[2]);
+                }
+            } else if (key === 'BG Verteidigerrangliste') {
+                const m = td.textContent.replace(/\s+/g, ' ')
+                    .match(/(\d+)\.\s*\(([\d\.,kmKM]+)\s+score\)/i);
+                if (m) {
+                    res.rankBGV = parseStat(m[1]);
+                    res.bgv = parseStat(m[2]);
+                }
+            } else if (key === 'Registriert seit') {
+                res.registered = td.textContent.trim();
+            } else if (key === 'Andere Welten des Spielers' || key === 'Frühere Welten des Spielers') {
+                const worlds = [];
+                td.querySelectorAll('span.world a').forEach(a => {
+                    worlds.push(a.textContent.trim());
+                });
+                res.otherWorlds = res.otherWorlds.concat(worlds);
+            }
+        });
+
+        log('Info parsed:', res);
+        return res;
+    }
+
+    // -------------------------------------------------------------------------
+    // TWStats: History-Tab (CSV)
+    // -------------------------------------------------------------------------
+
+    function parseHistoryDoc(doc) {
+        const ta = doc.querySelector('#export');
+        if (!ta) {
+            warn('History export not found');
+            return [];
+        }
+
+        const lines = ta.value.trim().split('\n');
+        const history = lines.map(line => {
+            const parts = line.split(',');
+            return {
+                date:   parts[0],
+                name:   parts[1],
+                tribe:  parts[2],
+                rank:   parseStat(parts[3]),
+                points: parseStat(parts[4]),
+                villages: parseStat(parts[5]),
+                bg:     parseStat(parts[6]),
+                bga:    parseStat(parts[7]),
+                bgv:    parseStat(parts[8]),
+            };
+        });
+        log('History parsed rows:', history.length);
+        return history;
+    }
+
+    function computeHistoryMetrics(history) {
+        if (!history.length) return {};
+
+        const now = history[0];
+        const metrics = {
+            now,
+            points7: 0,
+            bg7: 0,
+            bga7: 0,
+            bgv7: 0,
+            villGain7: 0,
+            villLoss7: 0,
+            avgPointsPerDay7: 0,
+            growthPercent7: 0,
+        };
+
+        const len = Math.min(7, history.length - 1);
+        if (len <= 0) return metrics;
+
+        let pointsSum = 0, bgSum = 0, bgaSum = 0, bgvSum = 0;
+        let gainSum = 0, lossSum = 0;
+
+        for (let i = 0; i < len; i++) {
+            const cur = history[i];
+            const nxt = history[i + 1];
+
+            const dp = cur.points - nxt.points;
+            const dv = cur.villages - nxt.villages;
+            const dbg = cur.bg - nxt.bg;
+            const dbga = cur.bga - nxt.bga;
+            const dbgv = cur.bgv - nxt.bgv;
+
+            pointsSum += dp;
+            bgSum += dbg;
+            bgaSum += dbga;
+            bgvSum += dbgv;
+
+            if (dv > 0) gainSum += dv;
+            else if (dv < 0) lossSum += -dv;
+        }
+
+        metrics.points7 = pointsSum;
+        metrics.bg7 = bgSum;
+        metrics.bga7 = bgaSum;
+        metrics.bgv7 = bgvSum;
+        metrics.villGain7 = gainSum;
+        metrics.villLoss7 = lossSum;
+        metrics.avgPointsPerDay7 = Math.round(pointsSum / len);
+        metrics.growthPercent7 = now.points ? Math.round(pointsSum / now.points * 100) : 0;
+
+        log('History metrics:', metrics);
+        return metrics;
+    }
+
+    // -------------------------------------------------------------------------
+    // TWStats: conquer_periods
+    // -------------------------------------------------------------------------
+
+    function parseConquerDoc(doc) {
+        const rows = doc.querySelectorAll('table.vis tr');
+        if (rows.length < 2) return null;
+        const tds = rows[1].querySelectorAll('td');
+        if (tds.length < 3) return null;
+
+        const total = parseStat(tds[1].textContent.trim());
+        const cellBars = tds[2];
+        let gain = 0, loss = 0;
+
+        const greenDiv = cellBars.querySelector('div[style*="background-color: green"]');
+        const redDiv   = cellBars.querySelector('div[style*="background-color: red"]');
+
+        if (greenDiv) gain = parseStat(greenDiv.textContent);
+        if (redDiv)   loss = parseStat(redDiv.textContent);
+
+        const res = {
+            total,
+            gain,
+            loss,
+            net: gain - loss
+        };
+        log('Conquer metrics:', res);
+        return res;
+    }
+
+    // -------------------------------------------------------------------------
+    // Heuristiken
+    // -------------------------------------------------------------------------
+
+    function classifyActivity(info, histMetrics) {
+        const p7   = histMetrics.points7 || 0;
+        const bg7  = histMetrics.bg7 || 0;
+        const gpct = histMetrics.growthPercent7 || 0;
+        const avgP = histMetrics.avgPointsPerDay7 || 0;
+
+        let label = 'unbekannt';
+        let col   = 'grey';
+
+        if (p7 <= 0 && bg7 <= 0) {
+            label = 'inaktiv / rückläufig';
+            col   = 'red';
+        } else if (gpct >= 30 || avgP >= 10000 || bg7 >= 50000) {
+            label = 'sehr aktiv';
+            col   = 'green';
+        } else if (gpct >= 10 || avgP >= 3000 || bg7 >= 15000) {
+            label = 'aktiv';
+            col   = 'darkgreen';
+        } else if (gpct >= 3 || avgP >= 1000 || bg7 >= 5000) {
+            label = 'mäßig aktiv';
+            col   = 'orange';
+        } else {
+            label = 'kaum aktiv';
+            col   = 'red';
+        }
+
+        log('Activity classification:', label, gpct, avgP, p7, bg7);
+        return { label, col };
+    }
+
+    function classifyOffDeff(info) {
+        const bga   = info.bga || 0;
+        const bgv   = info.bgv || 0;
+        const total = bga + bgv;
+
+        // Neue, etwas weichere Schwelle:
+        // Unter 200 BG ist die Datenlage wirklich dünn.
+        if (total < 200) {
+            const res = {
+                label:  'zu wenig BG-Daten',
+                col:    'grey',
+                offPct: 0,
+                defPct: 0
+            };
+            log('Off/Deff classification:', res);
+            return res;
+        }
+
+        const offPct = Math.round(bga / total * 100);
+        const defPct = 100 - offPct;
+
+        let label = 'ausgewogen';
+        let col   = 'orange';
+
+        if (offPct >= 65) {
+            label = 'Off-Spieler';
+            col   = 'red';
+        } else if (offPct <= 35) {
+            label = 'Def-Spieler';
+            col   = 'blue';
+        }
+
+        const res = { label, col, offPct, defPct };
+        log('Off/Deff classification:', res);
+        return res;
+    }
+
+    function classifyDanger(info, conq) {
+        const rank   = info.rankPoints || 999999;
+        const bgRank = info.rankBG || 999999;
+        const net    = conq ? (conq.net || 0) : 0;
+
+        let label = 'gering';
+        let col   = 'green';
+
+        if ((rank <= 10 || bgRank <= 20) && net >= 5) {
+            label = 'hoch';
+            col   = 'red';
+        } else if (rank <= 50 || bgRank <= 100) {
+            label = 'mittel';
+            col   = 'orange';
+        }
+
+        const res = { label, col };
+        log('Danger classification:', res);
+        return res;
+    }
+
+    // -------------------------------------------------------------------------
+    // Detail-Interpretation
+    // -------------------------------------------------------------------------
+
+    function describeSize(pts, villages) {
+        let sizeLabel = 'unbekannt';
+        let text      = '';
+
+        if (pts < 3000) {
+            sizeLabel = 'sehr kleiner Account';
+            text      = 'noch im sehr frühen Spielstadium (Aufbauphase).';
+        } else if (pts < 10000) {
+            sizeLabel = 'kleiner Account';
+            text      = 'frühes bis mittleres Spielstadium – meist 1–3 Dörfer.';
+        } else if (pts < 50000) {
+            sizeLabel = 'mittelgroßer Account';
+            text      = 'bereits solide aufgebaut, oft mehrere Dörfer.';
+        } else if (pts < 200000) {
+            sizeLabel = 'großer Account';
+            text      = 'deutlich ausgebaut, ernstzunehmender Faktor auf der Welt.';
+        } else {
+            sizeLabel = 'sehr großer Account';
+            text      = 'absolute Topgröße auf der Welt.';
+        }
+
+        return `Accountgröße: ${sizeLabel} (${fmt(pts)} Punkte, ${villages} Dorf/Dörfer) – ${text}`;
+    }
+
+    function describeExperience(info) {
+        const wCount = info.otherWorlds ? info.otherWorlds.length : 0;
+        if (wCount === 0) {
+            return 'Erfahrung: keine erkennbaren anderen Welten – evtl. Neuling oder nur auf Casual/Special aktiv.';
+        } else if (wCount <= 3) {
+            return `Erfahrung: einige frühere Welten (${wCount}) – grundlegende Spielkenntnisse vorhanden.`;
+        } else {
+            return `Erfahrung: viele frühere Welten (${wCount}) – erfahrener Spieler, kennt Mechaniken und Meta.`;
+        }
+    }
+
+    function describeActivityDetailed(activity, histMetrics, pts) {
+        const p7   = histMetrics.points7 || 0;
+        const avgP = histMetrics.avgPointsPerDay7 || 0;
+        const gpct = histMetrics.growthPercent7 || 0;
+
+        if (p7 <= 0 && histMetrics.bg7 <= 0) {
+            return 'Aktivität: kaum Punktezuwächse und keine nennenswerten Kämpfe – wirkt eher inaktiv oder rückläufig.';
+        }
+
+        let detail = `Aktivität: ${activity.label} – ca. ${fmt(avgP)} Punkte/Tag (${fmt(p7)} Punkte in ~7 Tagen, ~${gpct}% des aktuellen Punktestands). `;
+
+        if (pts && pts < 10000 && avgP >= 200) {
+            detail += 'Für diese Accountgröße ist das ein relativ hohes Wachstum.';
+        } else if (pts && pts > 50000 && avgP >= 3000) {
+            detail += 'Für einen größeren Account ist das ein gutes Wachstum.';
+        } else if (avgP < 200) {
+            detail += 'Die Zuwächse sind eher moderat.';
+        }
+
+        return detail.trim();
+    }
+
+    function describeOffDeffDetailed(offDeff, info) {
+        const totalBG = info.bg || 0;
+        const bga     = info.bga || 0;
+        const bgv     = info.bgv || 0;
+
+        if (offDeff.label === 'zu wenig BG-Daten') {
+            return `Kampferfahrung: sehr gering – bisher nur ${fmt(totalBG)} Gesamt-BG (BGA: ${fmt(bga)}, BGV: ${fmt(bgv)}). Off/Deff-Profil ist noch kaum aussagekräftig.`;
+        }
+
+        let core = `Kampferfahrung: bisher ${fmt(totalBG)} Gesamt-BG (BGA: ${fmt(bga)}, BGV: ${fmt(bgv)}). ` +
+                   `Off-Anteil ca. ${offDeff.offPct}%. `;
+
+        if (offDeff.label === 'Off-Spieler') {
+            core += 'Deutet auf einen klar offensiv orientierten Spieler hin.';
+        } else if (offDeff.label === 'Def-Spieler') {
+            core += 'Deutet eher auf einen defensiv orientierten Spieler hin (häufige Deff-Einsätze oder oft unter Beschuss).';
+        } else {
+            core += 'Die Werte wirken recht ausgewogen – kein extremes Off- oder Deff-Profil erkennbar.';
+        }
+
+        return core.trim();
+    }
+
+    function describeDangerDetailed(danger, info, conq) {
+        const rank   = info.rankPoints || 999999;
+        const bgRank = info.rankBG || 999999;
+        const net    = conq ? (conq.net || 0) : 0;
+
+        let text = `Gefahr: ${danger.label}. `;
+
+        if (danger.label === 'hoch') {
+            text += `Hoher Rang (Punkte-Rang ${rank}. oder BG-Rang ${bgRank}.) und positive Nettobilanz an Adelungen (${net >= 0 ? '+' : ''}${net}). ` +
+                    'Ein Spieler in dieser Kategorie ist als ernstzunehmender Gegner zu betrachten.';
+        } else if (danger.label === 'mittel') {
+            text += `Mittlere Rangposition (Punkte-Rang ${rank}., BG-Rang ${bgRank}.) und einige BG/Eroberungen. ` +
+                    'Auf dem Radar behalten – insbesondere, wenn er lokal viele Adelszüge fährt.';
+        } else {
+            text += `Rang eher weit hinten (Punkte-Rang ${rank}., BG-Rang ${bgRank}.) und bisher wenig BG/Eroberungen (${net >= 0 ? '+' : ''}${net}). ` +
+                    'Global geringe Gefahr, lokal kann er natürlich trotzdem stören.';
+        }
+
+        return text.trim();
+    }
+
+    // -------------------------------------------------------------------------
+    // BB-Note erzeugen
+    // -------------------------------------------------------------------------
+
+    function buildBbNote(world, info, histMetrics, activity, offDeff, danger, conq) {
+        const now = histMetrics.now || {};
+        const lines = [];
+
+        const pts      = info.points || now.points || 0;
+        const villages = info.villages || now.villages || 0;
+        const avgPoints = info.avgPoints || (villages ? Math.round(pts / villages) : 0);
+
+        // Header
+        lines.push(MARKER);
+        lines.push('');
+        lines.push(`[b]Spieler:[/b] [player]${info.name || now.name || '-'}[/player] (${world})`);
+        if (info.tribeTag) {
+            lines.push(`[b]Stamm:[/b] [ally]${info.tribeTag}[/ally]`);
+        } else {
+            lines.push('[b]Stamm:[/b] -');
+        }
+        lines.push('');
+
+        // Zusammenfassung
+        lines.push('[b]Zusammenfassung[/b]');
+        lines.push(`- Status: ${color(activity.label, activity.col)}`);
+        if (offDeff.offPct + offDeff.defPct > 0) {
+            lines.push(`- Typ: ${color(offDeff.label, offDeff.col)} (${offDeff.offPct}% Off / ${offDeff.defPct}% Deff)`);
+        } else {
+            lines.push(`- Typ: ${color(offDeff.label, offDeff.col)}`);
+        }
+        lines.push(`- Gefährlichkeit: ${color(danger.label, danger.col)}`);
+        lines.push('');
+
+        // Profil-Interpretation
+        lines.push('[b]Profil-Interpretation[/b]');
+        lines.push(`- ${describeSize(pts, villages)}`);
+        lines.push(`- ${describeActivityDetailed(activity, histMetrics, pts)}`);
+        lines.push(`- ${describeOffDeffDetailed(offDeff, info)}`);
+        lines.push(`- ${describeDangerDetailed(danger, info, conq)}`);
+        lines.push(`- ${describeExperience(info)}`);
+        lines.push('');
+
+        // Aktuelle Stats
+        lines.push('[b]Aktuelle Stats[/b]');
+        if (info.rankPoints != null) {
+            lines.push(`- Rang: ${info.rankPoints}.`);
+        }
+        lines.push(`- Punkte: ${fmt(pts)} (Ø ${fmt(avgPoints)} / Dorf)`);
+        lines.push(`- Dörfer: ${villages}`);
+        if (info.bg != null) {
+            lines.push(`- BG gesamt: ${fmt(info.bg)}${info.rankBG ? ` (Rang ${info.rankBG}.)` : ''}`);
+        }
+        if (info.bga != null) {
+            lines.push(`- BGA: ${fmt(info.bga)}${info.rankBGA ? ` (Rang ${info.rankBGA}.)` : ''}`);
+        }
+        if (info.bgv != null) {
+            lines.push(`- BGV: ${fmt(info.bgv)}${info.rankBGV ? ` (Rang ${info.rankBGV}.)` : ''}`);
+        }
+        lines.push('');
+
+        // Aktivität
+        lines.push('[b]Aktivität (ca. letzte 7 Tage)[/b]');
+        lines.push(`- Punkte: +${fmt(histMetrics.points7 || 0)} (ø ${fmt(histMetrics.avgPointsPerDay7 || 0)}/Tag, ${histMetrics.growthPercent7 || 0}% des Bestands)`);
+        lines.push(`- BG gesamt: +${fmt(histMetrics.bg7 || 0)} (BGA: +${fmt(histMetrics.bga7 || 0)}, BGV: +${fmt(histMetrics.bgv7 || 0)})`);
+        lines.push(`- Dörfer: +${histMetrics.villGain7 || 0} / -${histMetrics.villLoss7 || 0}`);
+        lines.push('');
+
+        // Eroberungen
+        if (conq) {
+            lines.push('[b]Eroberungen (aktueller Monat)[/b]');
+            lines.push(`- Adelungen: +${conq.gain}`);
+            lines.push(`- Verluste: -${conq.loss}`);
+            lines.push(`- Netto: [b]${conq.net >= 0 ? '+' : ''}${conq.net}[/b]`);
+            lines.push('');
+        }
+
+        // Sonstiges
+        lines.push('[b]Sonstiges[/b]');
+        if (info.registered) {
+            lines.push(`- Registriert seit: ${info.registered}`);
+        }
+        lines.push('');
+
+        // Mini-Guide
+        lines.push('[b]Kurz-Erläuterung der Werte[/b]');
+        lines.push('* [b]Punkte[/b]: Größe des Accounts. Mehr Punkte = mehr Dörfer / Ausbau, aber auch mehr Angriffspotential.');
+        lines.push('* [b]BG[/b] (Besiegte Gegner gesamt): Summe aller vernichteten gegnerischen Einheiten. Hohe BG = viel Kampferfahrung.');
+        lines.push('* [b]BGA[/b] (Besiegte Gegner als Angreifer): zeigt, wie aktiv der Spieler offensiv spielt (Angriffe).');
+        lines.push('* [b]BGV[/b] (Besiegte Gegner als Verteidiger): zeigt, wie oft und wie effektiv er defft oder angegriffen wird.');
+        lines.push('* [b]Rang[/b]: Platz im Welt-Ranking. Je niedriger der Rang, desto stärker der Account relativ zur Welt.');
+        lines.push('* Allgemein: Mehr BG ist tendenziell besser. Hohe [b]BGA[/b] = Off-Spieler, hohe [b]BGV[/b] = viele Deff-Aktionen / oft unter Beschuss.');
+        lines.push('');
+        lines.push(END_MARKER);
+
+        const text = lines.join('\n');
+        log('Generated BB note length:', text.length);
+        return text;
+    }
+
+    // -------------------------------------------------------------------------
+    // Notiz-Update (nur Auto-Block ersetzen, Rest behalten)
+    // -------------------------------------------------------------------------
+
+    function updateNoteWithAutoBlock(autoNoteText) {
+        const noteBox = document.querySelector('#message');
+        if (!noteBox) {
+            warn('#message (Notizfeld) nicht gefunden');
+            return;
+        }
+
+        let existing = noteBox.value || '';
+
+        const startIdx = existing.indexOf(MARKER);
+        if (startIdx !== -1) {
+            const endIdxRaw = existing.indexOf(END_MARKER, startIdx);
+            if (endIdxRaw !== -1) {
+                const endIdx = endIdxRaw + END_MARKER.length;
+                const before = existing.slice(0, startIdx).trimEnd();
+                const after  = existing.slice(endIdx).trimStart();
+                existing = (before ? before + '\n\n' : '') + (after ? after : '');
+                log('Alten Auto-Block entfernt');
+            }
+        }
+
+        if (existing.trim()) {
+            noteBox.value = autoNoteText + '\n\n' + existing;
+        } else {
+            noteBox.value = autoNoteText;
+        }
+
+        const saveButton = document.querySelector('#note_submit_button');
+        if (saveButton) {
+            log('Klicke Speichern-Button');
+            saveButton.click();
+        } else {
+            warn('Speichern-Button (#note_submit_button) nicht gefunden');
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // TWStats laden & Analyse bauen
+    // -------------------------------------------------------------------------
+
+    async function buildAutoNote(world, playerId) {
+        const baseUrl = `https://de.twstats.com/${world}/index.php?page=player&id=${playerId}`;
+        log('TWStats base URL:', baseUrl);
+
+        try {
+            const [infoHtml, histHtml, conqHtml] = await Promise.all([
+                gmGet(baseUrl + '&tab=info'),
+                gmGet(baseUrl + '&tab=history'),
+                gmGet(baseUrl + '&tab=conquer_periods'),
+            ]);
+
+            const parser  = new DOMParser();
+            const infoDoc = parser.parseFromString(infoHtml, 'text/html');
+            const histDoc = parser.parseFromString(histHtml, 'text/html');
+            const conqDoc = parser.parseFromString(conqHtml, 'text/html');
+
+            const info        = parseInfoDoc(infoDoc);
+            const history     = parseHistoryDoc(histDoc);
+            const histMetrics = computeHistoryMetrics(history);
+            const conq        = parseConquerDoc(conqDoc);
+
+            const activity = classifyActivity(info, histMetrics);
+            const offDeff  = classifyOffDeff(info);
+            const danger   = classifyDanger(info, conq);
+
+            return buildBbNote(world, info, histMetrics, activity, offDeff, danger, conq);
+        } catch (err) {
+            error('Fehler beim Laden/Auswerten:', err);
+            return null;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // UI-Button einfügen
+    // -------------------------------------------------------------------------
+
+    function insertTwStatsButton() {
+        const ths   = Array.from(document.querySelectorAll('#content_value th'));
+        const noteTh = ths.find(th => th.textContent.includes('Notizen'));
+        if (!noteTh) {
+            warn('Notizen-Header nicht gefunden');
+            return;
+        }
+
+        const btn = document.createElement('a');
+        btn.href      = '#';
+        btn.textContent = 'TWStats';
+        btn.className = 'float_right twstats-button';
+        btn.style.marginRight = '5px';
+
+        btn.addEventListener('click', async (ev) => {
+            ev.preventDefault();
+            if (processing) {
+                log('Bereits in Arbeit, ignoriere Klick.');
+                return;
+            }
+            processing = true;
+
+            const world    = getWorldFromHost();
+            const playerId = getPlayerIdFromPage();
+            if (!world || !playerId) {
+                warn('Abbruch: world oder playerId fehlt', { world, playerId });
+                processing = false;
+                return;
+            }
+
+            const autoNote = await buildAutoNote(world, playerId);
+            if (!autoNote) {
+                warn('Keine Auto-Notiz generiert');
+                processing = false;
+                return;
+            }
+
+            updateNoteWithAutoBlock(autoNote);
+            processing = false;
+        });
+
+        const editLink = noteTh.querySelector('a.float_right');
+        if (editLink) {
+            noteTh.insertBefore(btn, editLink);
+        } else {
+            noteTh.appendChild(btn);
+        }
+
+        log('TWStats-Button hinzugefügt');
+    }
+
+    // -------------------------------------------------------------------------
+    // Init
+    // -------------------------------------------------------------------------
+
+    function main() {
+        log('Script start:', window.location.href);
+
+        const url    = new URL(window.location.href);
+        const screen = url.searchParams.get('screen');
+        log('screen:', screen);
+
+        if (screen !== 'info_village') {
+            log('Kein info_village – nichts tun.');
+            return;
+        }
+
+        const host = window.location.host;
+        if (!/^de\d+\.die-staemme\.de$/.test(host)) {
+            log('Host ist keine deXXX-Welt, Host:', host);
+            return;
+        }
+
+        insertTwStatsButton();
+    }
+
+    main();
+
+})();
